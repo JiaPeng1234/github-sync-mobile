@@ -1672,10 +1672,28 @@ Expected: FAIL — cannot resolve `../../src/git/safe-git`.
 - [ ] **Step 4: Create `src/git/safe-git.ts` with construction, state, and status**
 
 ```ts
-import git from "isomorphic-git";
+import git, { TREE } from "isomorphic-git";
 import type { ExcludeMatcher } from "./exclude";
-import type { RepoStatus } from "../types";
+import type { ConflictFile, RepoStatus } from "../types";
 import { COMMIT_AUTHOR } from "../constants";
+
+interface ThreeWayRow {
+  path: string;
+  baseOid: string | null;
+  oursOid: string | null;
+  theirsOid: string | null;
+}
+
+/**
+ * A conflict awaiting the user's decision. Recorded by `mergeSafe` and consumed by
+ * `resolveConflicts`; while it is set, the repository is byte-identical to its
+ * pre-merge state.
+ */
+interface PendingConflict {
+  ourHead: string;
+  theirHead: string;
+  files: ConflictFile[];
+}
 
 export interface SafeGitOptions {
   fs: unknown;
@@ -1709,6 +1727,8 @@ export class SafeGit {
   private readonly branch: string;
   private readonly exclude: ExcludeMatcher;
   private readonly onLog: (line: string) => void;
+  /** Set while a conflict awaits resolution; see PendingConflict. */
+  private pending: PendingConflict | null = null;
 
   constructor(opts: SafeGitOptions) {
     this.fs = opts.fs as never;
@@ -2177,6 +2197,49 @@ describe("SafeGit.mergeSafe", () => {
     expect(f.theirs).toEqual({ state: "text", content: "remote version\n" });
   });
 
+  /**
+   * The test that pins the binary pre-screen.
+   *
+   * The attachment exists at the merge base and is edited in two well-separated
+   * regions, so isomorphic-git's three-way merge finds them separable and reports a
+   * CLEAN merge — corrupting the file silently and never asking. Deleting the
+   * pre-screen makes this test fail; the add/add cases below still pass without it,
+   * because there the engine raises a conflict on its own.
+   */
+  it("refuses to let the engine merge a binary changed on both sides", async () => {
+    const h = await makeHarness();
+
+    // Newline-separated so diff3 sees distinct regions, with invalid UTF-8 in each.
+    const row = (n: number) => [0x89, 0xff, 0xfe, n, 0x0a];
+    const baseBytes = new Uint8Array(
+      Array.from({ length: 40 }, (_, i) => row(i)).flat(),
+    );
+    await git.init({ fs: h.fs, dir: h.dir, defaultBranch: "main" });
+    await h.write("notes/a.md", "first\n");
+    await h.adapter.writeBinary("img.png", baseBytes.slice().buffer);
+    const base = await h.commit(["notes/a.md", "img.png"], "base with attachment");
+
+    const ourBytes = baseBytes.slice();
+    ourBytes[3] = 0x01; // edit near the start
+    await h.adapter.writeBinary("img.png", ourBytes.slice().buffer);
+    const localOid = await h.commit(["img.png"], "local edits the attachment");
+
+    const theirBytes = baseBytes.slice();
+    theirBytes[baseBytes.length - 2] = 0x02; // edit near the end
+    await divergeRemote(h, base, {}, "remote edits the attachment", async () => {
+      await h.adapter.writeBinary("img.png", theirBytes.slice().buffer);
+      await git.add({ fs: h.fs, dir: h.dir, filepath: "img.png" });
+    });
+
+    const out = await h.safeGit.mergeSafe();
+
+    // Without the pre-screen this is `merged`, with a corrupted blob committed.
+    expect(out.kind).toBe("conflict");
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(localOid);
+    const onDisk = new Uint8Array(await h.adapter.readBinary("img.png"));
+    expect(Array.from(onDisk)).toEqual(Array.from(ourBytes));
+  });
+
   // A conflicting attachment must survive resolution byte-for-byte. Carrying it
   // as a string would replace every invalid UTF-8 byte with U+FFFD and commit the
   // damage, which is the failure this plugin exists to prevent.
@@ -2288,10 +2351,11 @@ Expected: FAIL — `mergeSafe is not a function`.
 
 - [ ] **Step 3: Add merge support to `src/git/safe-git.ts`**
 
-Add these imports at the top of the file:
+Widen the existing type import at the top of the file (Task 7 already imports
+`ConflictFile` and `RepoStatus`):
 
 ```ts
-import type { ConflictFile, ConflictSide, MergeOutcome } from "../types";
+import type { ConflictFile, ConflictSide, MergeOutcome, RepoStatus } from "../types";
 ```
 
 Add these methods inside the `SafeGit` class:
@@ -2359,6 +2423,8 @@ Add these methods inside the `SafeGit` class:
     // this device's edits to them.
     const bothChanged = await this.diffBothSides(local, remote, bases[0]);
     if (await this.anyBinary(bothChanged, [bases[0], local, remote])) {
+      // describePaths drops excluded paths from what the user is asked about; the
+      // gate above already considered them, which is why the engine is skipped.
       const files = await this.describePaths(bothChanged, local, remote);
       this.pending = { ourHead: local, theirHead: remote, files };
       this.log(`merge: ${files.length} path(s) include binary content — resolving whole-file`);
@@ -2471,12 +2537,18 @@ Add these methods inside the `SafeGit` class:
   /**
    * True when any of the given paths is binary in any of the given commits.
    *
-   * Binary-ness is decided by whether the bytes survive a strict UTF-8 decode,
-   * which is the same test `readAtCommit` uses — not by file extension, which
-   * would miss an unlabelled attachment.
+   * Binary-ness is decided by whether the bytes survive a strict UTF-8 decode —
+   * the same test `readAtCommit` uses — not by file extension, which would miss an
+   * unlabelled attachment.
+   *
+   * Deliberately does NOT skip excluded paths. This is a safety gate, not a list of
+   * things to materialise. An excluded path can still be tracked by the remote, and
+   * the engine merges the whole tree regardless of what we check out, so filtering
+   * here would let it corrupt an excluded binary inside the commit and push it.
+   * "Don't sync this" must not become "corrupt this silently".
    */
   private async anyBinary(paths: string[], oids: string[]): Promise<boolean> {
-    for (const path of this.exclude.filter(paths)) {
+    for (const path of paths) {
       for (const oid of oids) {
         const side = await this.readAtCommit(oid, path);
         if (side.state === "binary") return true;
@@ -2486,33 +2558,55 @@ Add these methods inside the `SafeGit` class:
   }
 
   /**
-   * Paths changed on both sides since the merge base.
+   * Per-path blob oids in the merge base, ours, and theirs, in one tree walk.
    *
-   * Compares blob oids rather than content. Content comparison would have to
-   * decode first, and two different binaries can decode to the same string of
-   * replacement characters — which would hide a real conflict.
+   * Compares oids, never content: content comparison would have to decode first,
+   * and two different binaries can decode to the same string of replacement
+   * characters, hiding a real conflict.
+   *
+   * A single `git.walk` is used rather than per-path `readBlob` calls because
+   * `readBlob` inflates the whole blob just to learn its oid. On a vault of a few
+   * thousand notes that difference is roughly 16 seconds versus 30 milliseconds,
+   * and inflating every attachment three times risks being killed for memory on a
+   * phone. `entry.oid()` reads the tree entry only.
    */
+  private async threeWayOids(
+    base: string,
+    local: string,
+    remote: string,
+  ): Promise<ThreeWayRow[]> {
+    const rows: ThreeWayRow[] = [];
+    await git.walk({
+      ...this.base(),
+      trees: [TREE({ ref: base }), TREE({ ref: local }), TREE({ ref: remote })],
+      map: async (filepath, entries) => {
+        if (filepath === ".") return undefined;
+        const types = await Promise.all(entries.map((e) => (e ? e.type() : null)));
+        // Let the walk descend into directories; only compare leaves.
+        if (types.some((t) => t === "tree")) return undefined;
+        const [baseOid, oursOid, theirsOid] = await Promise.all(
+          entries.map((e) => (e ? e.oid() : null)),
+        );
+        rows.push({ path: filepath, baseOid, oursOid, theirsOid });
+        return undefined;
+      },
+    });
+    return rows;
+  }
+
+  /** Paths that changed on both sides, and differently, since the merge base. */
   private async diffBothSides(
     local: string,
     remote: string,
     base: string,
   ): Promise<string[]> {
-    const [baseFiles, localFiles, remoteFiles] = await Promise.all([
-      git.listFiles({ ...this.base(), ref: base }),
-      git.listFiles({ ...this.base(), ref: local }),
-      git.listFiles({ ...this.base(), ref: remote }),
-    ]);
-    const candidates = new Set([...localFiles, ...remoteFiles, ...baseFiles]);
-    const changed: string[] = [];
-    for (const path of candidates) {
-      const [b, l, r] = await Promise.all([
-        this.blobOid(base, path),
-        this.blobOid(local, path),
-        this.blobOid(remote, path),
-      ]);
-      if (l !== b && r !== b && l !== r) changed.push(path);
-    }
-    return changed;
+    const rows = await this.threeWayOids(base, local, remote);
+    return rows
+      .filter(
+        (r) =>
+          r.oursOid !== r.baseOid && r.theirsOid !== r.baseOid && r.oursOid !== r.theirsOid,
+      )
+      .map((r) => r.path);
   }
 
   /**
@@ -2526,7 +2620,7 @@ Add these methods inside the `SafeGit` class:
       const { oid: blobOid } = await git.readBlob({ ...this.base(), oid, filepath });
       return blobOid;
     } catch (err) {
-      if (isPathAbsent(err, oid)) return null;
+      if (isPathAbsent(err)) return null;
       throw new Error(`Cannot read ${filepath} at ${oid.slice(0, 7)}: ${message(err)}`);
     }
   }
@@ -2548,7 +2642,7 @@ Add these methods inside the `SafeGit` class:
       const { blob } = await git.readBlob({ ...this.base(), oid, filepath });
       bytes = blob;
     } catch (err) {
-      if (isPathAbsent(err, oid)) return { state: "absent" };
+      if (isPathAbsent(err)) return { state: "absent" };
       return { state: "unreadable", error: message(err) };
     }
     try {
@@ -2559,11 +2653,47 @@ Add these methods inside the `SafeGit` class:
   }
 ```
 
+Add these module-private helpers at the bottom of the file, outside the class:
+
+```ts
+/**
+ * True when a git read failed because the path is genuinely absent from that tree,
+ * as opposed to an object being unreadable.
+ *
+ * isomorphic-git raises `NotFoundError` for both, so the code alone cannot decide.
+ * The distinction is in `data.what`: for a missing path it is a human-readable
+ * string like `file or directory found at "<oid>:<path>"`, whereas for a missing
+ * object it is the bare oid. Testing that shape is the reliable discriminator.
+ *
+ * Comparing `data.what` against the commit oid does NOT work, even though the
+ * library does something similar elsewhere for a missing commit: `resolveFilepath`
+ * reassigns the oid to the blob's own oid before reading the object, so a torn
+ * packfile reports the blob oid, which never equals the commit oid passed in. That
+ * mistake classified a damaged object as `absent`, and resolution acts on `absent`
+ * by deleting and committing — turning corruption into deliberate-looking deletion.
+ *
+ * ENOENT is deliberately not treated as absent: that is a filesystem condition, and
+ * the fs bridge keeps it distinct precisely so a read failure cannot read as a
+ * deletion.
+ */
+const OID = /^[0-9a-f]{40}$/;
+
+function isPathAbsent(err: unknown): boolean {
+  const e = err as { code?: string; data?: { what?: string } };
+  if (e?.code !== "NotFoundError") return false;
+  return !OID.test(e.data?.what ?? "");
+}
+
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+```
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/safe-git-merge.test.ts`
-Expected: PASS, 14 tests. The "working tree untouched", binary-reporting, and idempotency
-assertions are the critical ones.
+Expected: PASS, 15 tests. The pre-screen test, the "working tree untouched" assertions, and
+the idempotency block are the critical ones.
 
 - [ ] **Step 5: Commit**
 
@@ -2711,24 +2841,46 @@ describe("SafeGit.resolveConflicts", () => {
     expect(Array.from(onDisk)).not.toContain(0xef); // no U+FFFD bytes
   });
 
-  it("refuses to resolve when the chosen side could not be read, changing nothing", async () => {
+  /**
+   * Two conflicting files, the second unreadable. With writes decided up front the
+   * first file is untouched; screening as we went would already have written and
+   * staged it before refusing, making the "Nothing was changed" message a lie.
+   */
+  it("refuses without writing anything when a later chosen side is unreadable", async () => {
     const h = await makeHarness();
-    const { localHead } = await conflicted(h);
+    const first = await initRepo(h);
+    await h.write("notes/a.md", "local a\n");
+    await h.write("notes/b.md", "local b\n");
+    const localOid = await h.commit(["notes/a.md", "notes/b.md"], "local edits both");
+    await divergeRemote(
+      h,
+      first,
+      { "notes/a.md": "remote a\n", "notes/b.md": "remote b\n" },
+      "remote edits both",
+    );
 
-    // Simulate a damaged object by making the chosen side unreadable.
+    const out = await h.safeGit.mergeSafe();
+    if (out.kind !== "conflict") throw new Error("expected a conflict");
+    expect(out.files.length).toBe(2);
+
+    // Damage whichever file the resolver would reach second.
     const pending = (h.safeGit as unknown as {
-      pending: { files: Array<{ path: string; theirs: unknown }> } | null;
+      pending: { files: Array<{ path: string; theirs: unknown }> };
     }).pending;
-    if (!pending) throw new Error("expected a pending conflict");
-    pending.files[0].theirs = { state: "unreadable", error: "simulated damage" };
+    const damaged = pending.files[1].path;
+    pending.files[1].theirs = { state: "unreadable", error: "simulated damage" };
+    const intact = pending.files[0].path;
+    const before = await h.adapter.read(intact);
 
-    const before = await h.adapter.read("notes/a.md");
     await expect(
-      h.safeGit.resolveConflicts([{ path: "notes/a.md", choice: "theirs" }]),
+      h.safeGit.resolveConflicts(
+        pending.files.map((f) => ({ path: f.path, choice: "theirs" as const })),
+      ),
     ).rejects.toThrow(/could not be read/i);
 
-    expect(await h.adapter.read("notes/a.md")).toBe(before);
-    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(localHead);
+    expect(damaged).not.toBe(intact);
+    expect(await h.adapter.read(intact)).toBe(before);
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(localOid);
   });
 
   it("throws when there is no pending conflict", async () => {
@@ -2770,19 +2922,10 @@ export interface ConflictResolution {
   path: string;
   choice: "mine" | "theirs";
 }
-
-interface PendingConflict {
-  ourHead: string;
-  theirHead: string;
-  files: ConflictFile[];
-}
 ```
 
-Add a private field to the class, alongside the other fields:
-
-```ts
-  private pending: PendingConflict | null = null;
-```
+`PendingConflict` and the `pending` field were already declared in Task 9, because
+`mergeSafe` sets them.
 
 In `mergeSafe`, record the pending conflict. Replace the `return { kind: "conflict", files: conflicts };` line with:
 
@@ -2845,28 +2988,45 @@ Then add these methods to the class:
       planned.push({ path: file.path, side });
     }
 
-    // Bring in every non-conflicting remote change too. Compare blob oids rather
-    // than content so binaries are never decoded on this path either.
-    const remoteFiles = this.exclude.filter(
-      await git.listFiles({ ...this.base(), ref: pending.theirHead }),
-    );
+    // Bring in every non-conflicting remote change too, using ordinary three-way
+    // logic: take theirs where the remote changed a path and this device did not.
+    //
+    // Walking the merge base as well as both heads is what makes remote *deletions*
+    // apply. Iterating only the remote's file list would skip them, leaving the local
+    // copy in place while the merge commit claimed that commit had been merged — so
+    // the deletion would never be offered again.
+    const bases = await git.findMergeBase({
+      ...this.base(),
+      oids: [pending.ourHead, pending.theirHead],
+    });
+    const rows = await this.threeWayOids(bases[0], pending.ourHead, pending.theirHead);
     const conflictPaths = new Set(pending.files.map((f) => f.path));
-    for (const path of remoteFiles) {
-      if (conflictPaths.has(path)) continue;
-      const [oursOid, theirsOid] = await Promise.all([
-        this.blobOid(pending.ourHead, path),
-        this.blobOid(pending.theirHead, path),
-      ]);
-      if (theirsOid === null || oursOid === theirsOid) continue;
-      const theirs = await this.readAtCommit(pending.theirHead, path);
+
+    for (const row of rows) {
+      if (conflictPaths.has(row.path)) continue;
+      if (this.exclude.isExcluded(row.path)) continue;
+      const remoteChanged = row.theirsOid !== row.baseOid;
+      const weChanged = row.oursOid !== row.baseOid;
+      if (!remoteChanged || weChanged) continue;
+
+      if (row.theirsOid === null) {
+        planned.push({ path: row.path, side: { state: "absent" } });
+        continue;
+      }
+      const theirs = await this.readAtCommit(pending.theirHead, row.path);
       if (theirs.state === "unreadable") {
         throw new Error(
-          `Cannot apply the remote version of ${path} (${theirs.error}). Nothing was changed.`,
+          `Cannot apply the remote version of ${row.path} (${theirs.error}). ` +
+            `Nothing was changed.`,
         );
       }
-      planned.push({ path, side: theirs });
+      planned.push({ path: row.path, side: theirs });
     }
 
+    // Everything that could be screened has been. A failure inside this loop (an
+    // adapter error mid-write) leaves earlier files applied and no merge commit;
+    // `pending` is deliberately not cleared, so the next sync re-offers the conflict
+    // rather than treating the partial state as merged.
     for (const { path, side } of planned) {
       await this.materialise(path, side);
     }
@@ -3171,31 +3331,6 @@ Add these methods to the class:
 Add this module-private helper at the bottom of the file, outside the class:
 
 ```ts
-/**
- * True when a git read failed because the path is genuinely absent from that tree,
- * as opposed to the object being unreadable.
- *
- * isomorphic-git throws `NotFoundError` for both cases, so the code alone is not
- * enough: it also throws it when an object is missing from the object store, which
- * is what a torn packfile after an interrupted write looks like. It disambiguates
- * internally by comparing `data.what` to the oid, and so must we — misreading a
- * damaged object as "the user deleted this file" would make resolution delete and
- * commit it.
- *
- * ENOENT is deliberately NOT treated as absent: that is a filesystem condition,
- * and the fs bridge keeps it distinct precisely so a read failure cannot be read
- * as a deletion.
- */
-function isPathAbsent(err: unknown, oid: string): boolean {
-  const e = err as { code?: string; data?: { what?: string } };
-  if (e?.code !== "NotFoundError") return false;
-  return e.data?.what !== oid;
-}
-
-function message(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 /** Compares remote URLs ignoring a trailing .git and case. */
 function sameRepo(a: string, b: string): boolean {
   const norm = (u: string) => u.trim().replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();

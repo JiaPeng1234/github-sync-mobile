@@ -257,11 +257,29 @@ An unreadable side is refused before anything is written.
 **Binary files are never merged by content.** isomorphic-git's own merge decodes both sides with
 a non-fatal UTF-8 conversion and re-encodes the result, so letting it merge a binary silently
 corrupts it — and because the three-way algorithm usually finds separable regions in a large
-file, it would report a *clean* merge and never ask. The plugin therefore installs a merge driver
-that refuses any file whose content does not survive a strict UTF-8 round trip, routing it to the
-conflict path instead, where both versions are carried as bytes and the user chooses whole-file.
-A text file that genuinely contains U+FFFD is also routed there; a needless question is an
-acceptable price for never corrupting an attachment.
+file, it reports a *clean* merge and never asks. Measured: a 240-byte attachment edited on two
+devices came back at 676 bytes containing 218 replacement characters, reported as a clean merge.
+
+So before the engine is invoked at all, the plugin compares blob oids across base/ours/theirs in
+a single tree walk, and asks whether any path changed on both sides is binary — decided by
+whether its bytes survive a *strict* UTF-8 decode, not by file extension. If any is, every
+both-sides change is surfaced for whole-file choice and the engine's merge never runs. The
+breadth is deliberate: conflicting on the binary alone would leave text files that also changed
+on both sides to be swept in as "theirs", discarding this device's edits to them. The check
+ignores exclude patterns, because an excluded path can still be tracked by the remote and the
+engine merges the whole tree regardless of what is checked out — "don't sync this" must not
+become "corrupt this silently".
+
+When no binary is involved the engine still merges text, so two devices editing different
+regions of the same note continue to combine cleanly instead of being forced into a choice.
+
+A merge driver was considered and rejected: `mergeDriver` replaces the default driver outright,
+so refusing there would have turned every ordinary text merge into a whole-file choice.
+
+Known limits of the detector: UTF-16 without a byte-order mark, and all-NUL content, decode as
+valid UTF-8 and are treated as text. Neither can be corrupted byte-wise — valid UTF-8 round-trips
+exactly — so the residual risk is line-based splicing of a non-line-oriented file, and Obsidian
+vaults are UTF-8.
 
 **Phase 2** adds line-level resolution (diff3, conflict markers) on top of this seam without
 redesigning phase 1.
