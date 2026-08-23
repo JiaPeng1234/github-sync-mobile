@@ -827,6 +827,11 @@ Three constraints inherited from earlier tasks, all load-bearing:
   error (with `code: "ENOENT"`) instead of masking it. If a needed `mkdir` were hidden here, the
   omission would only ever surface on a phone. **If real isomorphic-git turns out not to recover,
   report it — do not loosen the adapter.**
+- **Keep `ENOENT` and `ENOTDIR` distinct in `readdir`.** isomorphic-git turns either into `null`
+  to tell "absent or not a directory" apart from "an empty directory". If the bridge collapsed
+  them, or returned an empty array for an absent path, a tree walk would read a missing subtree
+  as an empty one — that is, as deleted. An existing empty directory must list as empty; an
+  absent one must throw.
 
 Two further gotchas were real bugs in the prior plugin and are covered by tests:
 
@@ -935,6 +940,25 @@ describe("fs-adapter", () => {
     });
   });
 
+  it("throws ENOENT from readdir for a missing path", async () => {
+    const { fs } = setup();
+    await expect(fs.readdir("nope")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("throws ENOTDIR from readdir for a file path", async () => {
+    const { fs } = setup();
+    await fs.writeFile("a.md", "x");
+    await expect(fs.readdir("a.md")).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  // The distinction being protected: an existing but empty directory must list
+  // as empty, not throw -- that is what separates "empty" from "gone".
+  it("returns an empty array for an existing empty directory", async () => {
+    const { fs } = setup();
+    await fs.mkdir("empty");
+    expect(await fs.readdir("empty")).toEqual([]);
+  });
+
   it("deletes a file with unlink", async () => {
     const { fs } = setup();
     await fs.writeFile("a.md", "x");
@@ -988,6 +1012,14 @@ function enoent(path: string): Error & { code: string } {
     code: string;
   };
   e.code = "ENOENT";
+  return e;
+}
+
+function enotdir(path: string): Error & { code: string } {
+  const e = new Error(`ENOTDIR: not a directory, '${path}'`) as Error & {
+    code: string;
+  };
+  e.code = "ENOTDIR";
   return e;
 }
 
@@ -1072,7 +1104,14 @@ export function createFs(adapter: DataAdapter, base: string) {
     async readdir(path: string): Promise<string[]> {
       const p = rel(path);
       const st = await adapter.stat(p);
-      if (p !== "" && (!st || st.type !== "folder")) throw enoent(path);
+      // isomorphic-git converts ENOENT/ENOTDIR from readdir into `null`, which is
+      // how it tells "absent or not a directory" apart from "an empty directory".
+      // Collapsing the two would make a tree walk read an absent subtree as empty,
+      // i.e. as deleted. Keep the codes distinct.
+      if (p !== "") {
+        if (!st) throw enoent(path);
+        if (st.type !== "folder") throw enotdir(path);
+      }
       const listing = await adapter.list(p);
       const base = p === "" ? "" : `${p}/`;
       return [...listing.files, ...listing.folders].map((f) =>
