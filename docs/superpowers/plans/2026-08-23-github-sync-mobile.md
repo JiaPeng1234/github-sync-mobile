@@ -827,6 +827,10 @@ Three constraints inherited from earlier tasks, all load-bearing:
   error (with `code: "ENOENT"`) instead of masking it. If a needed `mkdir` were hidden here, the
   omission would only ever surface on a phone. **If real isomorphic-git turns out not to recover,
   report it — do not loosen the adapter.**
+- **`EISDIR` is a real outcome now.** The adapter enforces that files and folders never occupy
+  the same path, so writing to a path held by a folder rejects with `code: "EISDIR"` and
+  `mkdir` at or under an existing file rejects with `code: "ENOTDIR"`. Map or propagate these;
+  do not swallow them.
 - **Keep `ENOENT` and `ENOTDIR` distinct in `readdir`.** isomorphic-git turns either into `null`
   to tell "absent or not a directory" apart from "an empty directory". If the bridge collapsed
   them, or returned an empty array for an absent path, a tree walk would read a missing subtree
