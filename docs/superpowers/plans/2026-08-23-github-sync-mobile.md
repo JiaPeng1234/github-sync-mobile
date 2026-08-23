@@ -533,30 +533,52 @@ export interface PluginSettings {
   commitMessageTemplate: string;
 }
 
+/**
+ * One side's version of a conflicting file.
+ *
+ * Deliberately not `string | null`. Vaults contain images and PDFs, and decoding
+ * a blob to a string to carry it through resolution is lossy: a non-fatal
+ * TextDecoder turns every invalid UTF-8 byte into U+FFFD, so writing the result
+ * back would silently corrupt the attachment and commit the damage. Both ends of
+ * this pipeline already speak bytes, so bytes are what we carry.
+ *
+ * `unreadable` is separate from `absent` on purpose. A failed blob read must never
+ * be mistaken for "the user deleted this file", because resolution acts on
+ * `absent` by deleting and committing.
+ */
+export type ConflictSide =
+  | { state: "absent" }
+  | { state: "text"; content: string }
+  | { state: "binary"; bytes: Uint8Array }
+  | { state: "unreadable"; error: string };
+
 /** A file that differs on both sides and needs a user decision. */
 export interface ConflictFile {
   path: string;
-  /** Working-tree/local content. Null when the local side deleted it. */
-  ours: string | null;
-  /** Remote content. Null when the remote side deleted it. */
-  theirs: string | null;
+  /** The working-tree/local version. */
+  ours: ConflictSide;
+  /** The fetched remote version. */
+  theirs: ConflictSide;
 }
 
+/**
+ * `unmergeable` is distinct from `conflict` because the two demand different
+ * responses: a conflict is resolvable per file in the app, an unmergeable history
+ * cannot be resolved here at all.
+ */
 export type MergeOutcome =
   | { kind: "up-to-date" }
   | { kind: "fast-forward"; oid: string }
   | { kind: "merged"; oid: string }
-  | { kind: "conflict"; files: ConflictFile[]; reason: ConflictReason };
+  | { kind: "conflict"; files: ConflictFile[] }
+  | { kind: "unmergeable"; reason: UnmergeableReason };
 
 /**
- * Why a merge could not proceed. `unrelated-histories` and `multiple-merge-bases`
- * are isomorphic-git limitations we deliberately surface as conflicts instead of
- * letting them crash or improvise.
+ * Histories isomorphic-git cannot merge: no recursive merge strategy, so it throws
+ * when several merge bases exist (two devices diverging), and it cannot join two
+ * unrelated roots.
  */
-export type ConflictReason =
-  | "file-conflict"
-  | "unrelated-histories"
-  | "multiple-merge-bases";
+export type UnmergeableReason = "unrelated-histories" | "multiple-merge-bases";
 
 export interface RepoStatus {
   /** Non-excluded files differing from HEAD. */
@@ -567,17 +589,24 @@ export interface RepoStatus {
 
 export type StepResult = "ok" | "skipped" | "failed";
 
+export type StepName = "commit" | "fetch" | "merge" | "push";
+
 export interface SyncStep {
-  name: "commit" | "fetch" | "merge" | "push";
+  name: StepName;
   result: StepResult;
   detail: string;
 }
 
 export interface SyncReport {
-  steps: SyncStep[];
-  conflicts: ConflictFile[];
-  /** True when every attempted step succeeded and no conflict was found. */
-  success: boolean;
+  readonly steps: readonly SyncStep[];
+  readonly conflicts: readonly ConflictFile[];
+  /**
+   * Set by whoever builds the report; read it rather than recomputing. True when
+   * no attempted step failed and no conflict is outstanding — a `skipped` step
+   * does not make a sync unsuccessful.
+   */
+  readonly success: boolean;
+  /** Mutable: the plugin appends its own trace lines after the sync returns. */
   logs: string[];
 }
 ```
@@ -588,22 +617,65 @@ export interface SyncReport {
 export const DEFAULT_BRANCH = "main";
 
 /**
- * Excluded by default because these are per-device and cause spurious conflicts.
- * `.obsidian/` additionally holds this plugin's settings — including the GitHub
- * token — in plaintext, so excluding it also prevents publishing the token.
+ * Never synced, in either direction.
+ *
+ * `.obsidian/` and `.trash/` are per-device and would conflict constantly.
+ * `.obsidian/` also holds this plugin's settings — including the GitHub token —
+ * in plaintext, so excluding it is what keeps the token out of the repository.
+ * `.git/` is git's own metadata; isomorphic-git already skips it, so listing it is
+ * defence in depth rather than a fix for an observed problem.
+ *
+ * `readonly` is deliberate: this array is the token-leak guard, and every consumer
+ * must copy it (`[...DEFAULT_EXCLUDES]`) before editing. Without the modifier, one
+ * aliasing assignment plus a later `push` would corrupt the defaults that "reset
+ * to defaults" restores.
  */
-export const DEFAULT_EXCLUDES = [".obsidian/", ".git/", ".trash/"];
+export const DEFAULT_EXCLUDES: readonly string[] = [
+  ".obsidian/",
+  ".git/",
+  ".trash/",
+];
 
-export const DEFAULT_COMMIT_TEMPLATE = "Vault sync from mobile — {{timestamp}}";
+/** Substituted with the current local date and time when a commit is made. */
+export const TIMESTAMP_TOKEN = "{{timestamp}}";
 
-export const COMMIT_AUTHOR = {
+export const DEFAULT_COMMIT_TEMPLATE = `Vault sync from mobile — ${TIMESTAMP_TOKEN}`;
+
+/**
+ * Fallback commit identity, used only when the authenticated login is unknown.
+ *
+ * The address is under `invalid.` — a reserved TLD that can never be registered or
+ * delivered to (RFC 2606). A plausible-looking `@users.noreply.github.com` address
+ * would be worse: GitHub would fail to attribute the commits, and if anyone ever
+ * registered the matching account, every commit this plugin had made would be
+ * attributed to them.
+ */
+export const COMMIT_AUTHOR: { readonly name: string; readonly email: string } = {
   name: "github-sync-mobile",
-  email: "github-sync-mobile@users.noreply.github.com",
+  email: "github-sync-mobile@localhost.invalid",
 };
 
 export const GITHUB_API = "https://api.github.com";
 
+/**
+ * Owner, repo, and branch names the plugin is willing to interpolate into a URL or
+ * a ref. Deliberately strict: these come straight from text fields, and on iOS a
+ * malformed value produces a confusing failure the user cannot inspect. Rejecting
+ * it early lets the caller name the offending field instead.
+ */
+const SEGMENT = /^[A-Za-z0-9._-]+$/;
+
+export function isValidSegment(value: string): boolean {
+  return SEGMENT.test(value) && value !== "." && value !== "..";
+}
+
 export function repoUrl(owner: string, repo: string): string {
+  if (!isValidSegment(owner)) {
+    throw new Error(`Invalid repository owner: ${JSON.stringify(owner)}`);
+  }
+  if (!isValidSegment(repo)) {
+    throw new Error(`Invalid repository name: ${JSON.stringify(repo)}`);
+  }
   return `https://github.com/${owner}/${repo}.git`;
 }
 ```
@@ -1991,6 +2063,8 @@ async function divergeRemote(
   base: string,
   changes: Record<string, string>,
   message: string,
+  /** Extra staging for cases text changes cannot express, e.g. binary writes. */
+  extra?: () => Promise<void>,
 ): Promise<string> {
   const localHead = await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main" });
 
@@ -1998,6 +2072,7 @@ async function divergeRemote(
   await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
   for (const [p, c] of Object.entries(changes)) await h.write(p, c);
   for (const p of Object.keys(changes)) await git.add({ fs: h.fs, dir: h.dir, filepath: p });
+  if (extra) await extra();
   const remoteOid = await git.commit({ fs: h.fs, dir: h.dir, message, author: COMMIT_AUTHOR });
 
   await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: localHead, force: true });
@@ -2080,7 +2155,6 @@ describe("SafeGit.mergeSafe", () => {
 
     expect(out.kind).toBe("conflict");
     if (out.kind === "conflict") {
-      expect(out.reason).toBe("file-conflict");
       expect(out.files.map((f) => f.path)).toContain("notes/a.md");
     }
     // Nothing written, no conflict markers, HEAD unmoved.
@@ -2099,8 +2173,32 @@ describe("SafeGit.mergeSafe", () => {
     const out = await h.safeGit.mergeSafe();
     if (out.kind !== "conflict") throw new Error("expected conflict");
     const f = out.files.find((x) => x.path === "notes/a.md")!;
-    expect(f.ours).toBe("local version\n");
-    expect(f.theirs).toBe("remote version\n");
+    expect(f.ours).toEqual({ state: "text", content: "local version\n" });
+    expect(f.theirs).toEqual({ state: "text", content: "remote version\n" });
+  });
+
+  // A conflicting attachment must survive resolution byte-for-byte. Carrying it
+  // as a string would replace every invalid UTF-8 byte with U+FFFD and commit the
+  // damage, which is the failure this plugin exists to prevent.
+  it("reports a conflicting binary file as bytes, not as text", async () => {
+    const h = await makeHarness();
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe]);
+    const first = await initRepo(h);
+    await h.adapter.writeBinary("img.png", png.slice().buffer);
+    await h.commit(["img.png"], "local binary");
+
+    const other = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    await divergeRemote(h, first, {}, "remote binary", async () => {
+      await h.adapter.writeBinary("img.png", other.slice().buffer);
+      await git.add({ fs: h.fs, dir: h.dir, filepath: "img.png" });
+    });
+
+    const out = await h.safeGit.mergeSafe();
+    if (out.kind !== "conflict") throw new Error("expected conflict");
+    const f = out.files.find((x) => x.path === "img.png")!;
+    expect(f.ours.state).toBe("binary");
+    expect(f.theirs.state).toBe("binary");
+    if (f.ours.state === "binary") expect(Array.from(f.ours.bytes)).toEqual(Array.from(png));
   });
 
   it("treats unrelated histories as a conflict rather than crashing", async () => {
@@ -2122,8 +2220,8 @@ describe("SafeGit.mergeSafe", () => {
     await setOriginRef(h, orphan);
 
     const out = await h.safeGit.mergeSafe();
-    expect(out.kind).toBe("conflict");
-    if (out.kind === "conflict") expect(out.reason).toBe("unrelated-histories");
+    expect(out.kind).toBe("unmergeable");
+    if (out.kind === "unmergeable") expect(out.reason).toBe("unrelated-histories");
   });
 
   it("does not report a conflict for changes confined to excluded paths", async () => {
@@ -2193,7 +2291,7 @@ Expected: FAIL — `mergeSafe is not a function`.
 Add these imports at the top of the file:
 
 ```ts
-import type { ConflictFile, MergeOutcome } from "../types";
+import type { ConflictFile, ConflictSide, MergeOutcome } from "../types";
 ```
 
 Add these methods inside the `SafeGit` class:
@@ -2234,11 +2332,11 @@ Add these methods inside the `SafeGit` class:
 
     if (bases.length === 0) {
       this.log("merge: no common ancestor — refusing to merge unrelated histories");
-      return { kind: "conflict", files: [], reason: "unrelated-histories" };
+      return { kind: "unmergeable", reason: "unrelated-histories" };
     }
     if (bases.length > 1) {
       this.log("merge: multiple merge bases — unsupported by the engine, stopping safely");
-      return { kind: "conflict", files: [], reason: "multiple-merge-bases" };
+      return { kind: "unmergeable", reason: "multiple-merge-bases" };
     }
 
     if (bases[0] === local) {
@@ -2261,7 +2359,7 @@ Add these methods inside the `SafeGit` class:
       const conflicts = await this.describeConflicts(err, local, remote, bases[0]);
       if (conflicts.length === 0) throw err;
       this.log(`merge: conflict in ${conflicts.length} file(s) — nothing written`);
-      return { kind: "conflict", files: conflicts, reason: "file-conflict" };
+      return { kind: "conflict", files: conflicts };
     }
 
     // Probe was clean, so this cannot conflict.
@@ -2339,7 +2437,13 @@ Add these methods inside the `SafeGit` class:
     return out;
   }
 
-  /** Paths changed on both sides since the merge base. */
+  /**
+   * Paths changed on both sides since the merge base.
+   *
+   * Compares blob oids rather than content. Content comparison would have to
+   * decode first, and two different binaries can decode to the same string of
+   * replacement characters — which would hide a real conflict.
+   */
   private async diffBothSides(
     local: string,
     remote: string,
@@ -2354,22 +2458,49 @@ Add these methods inside the `SafeGit` class:
     const changed: string[] = [];
     for (const path of candidates) {
       const [b, l, r] = await Promise.all([
-        this.readAtCommit(base, path),
-        this.readAtCommit(local, path),
-        this.readAtCommit(remote, path),
+        this.blobOid(base, path),
+        this.blobOid(local, path),
+        this.blobOid(remote, path),
       ]);
       if (l !== b && r !== b && l !== r) changed.push(path);
     }
     return changed;
   }
 
-  /** File content at a commit, or null when absent there. */
-  private async readAtCommit(oid: string, filepath: string): Promise<string | null> {
+  /** The blob oid for a path at a commit, or null when absent there. */
+  private async blobOid(oid: string, filepath: string): Promise<string | null> {
     try {
-      const { blob } = await git.readBlob({ ...this.base(), oid, filepath });
-      return new TextDecoder().decode(blob);
+      const { oid: blobOid } = await git.readBlob({ ...this.base(), oid, filepath });
+      return blobOid;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * One side's version of a file at a commit.
+   *
+   * Keeps the raw bytes and only decodes when the content is valid UTF-8, using a
+   * fatal decoder. A non-fatal decode would replace every invalid byte with U+FFFD,
+   * and writing that back during resolution would corrupt the attachment.
+   *
+   * A read failure is reported as `unreadable`, never as `absent`: resolution
+   * deletes and commits on `absent`, so conflating the two would turn a torn
+   * packfile or an out-of-memory into a durable deletion of a file that exists.
+   */
+  private async readAtCommit(oid: string, filepath: string): Promise<ConflictSide> {
+    let bytes: Uint8Array;
+    try {
+      const { blob } = await git.readBlob({ ...this.base(), oid, filepath });
+      bytes = blob;
+    } catch (err) {
+      if (isNotFound(err)) return { state: "absent" };
+      return { state: "unreadable", error: message(err) };
+    }
+    try {
+      return { state: "text", content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    } catch {
+      return { state: "binary", bytes };
     }
   }
 ```
@@ -2543,11 +2674,11 @@ Add a private field to the class, alongside the other fields:
   private pending: PendingConflict | null = null;
 ```
 
-In `mergeSafe`, record the pending conflict. Replace the `return { kind: "conflict", files: conflicts, reason: "file-conflict" };` line with:
+In `mergeSafe`, record the pending conflict. Replace the `return { kind: "conflict", files: conflicts };` line with:
 
 ```ts
       this.pending = { ourHead: local, theirHead: remote, files: conflicts };
-      return { kind: "conflict", files: conflicts, reason: "file-conflict" };
+      return { kind: "conflict", files: conflicts };
 ```
 
 Then add these methods to the class:
@@ -2580,43 +2711,45 @@ Then add these methods to the class:
       throw new Error(`unresolved conflict(s): ${missing.join(", ")}`);
     }
 
-    // Start from our tree, then apply each decision explicitly.
+    // Refuse before touching anything if either chosen side could not be read.
+    // Acting on an unreadable side would either delete a file that exists or
+    // write corrupted content, and the working tree is still pristine here.
     for (const file of pending.files) {
-      const choice = byPath.get(file.path)!;
-      const content = choice === "mine" ? file.ours : file.theirs;
-
-      if (content === null) {
-        // The chosen side deleted it.
-        try {
-          await (this.fs as unknown as {
-            promises: { unlink(p: string): Promise<void> };
-          }).promises.unlink(this.join(file.path));
-        } catch {
-          // Already absent.
-        }
-        await git.remove({ ...this.base(), filepath: file.path });
-      } else {
-        await (this.fs as unknown as {
-          promises: { writeFile(p: string, d: string): Promise<void> };
-        }).promises.writeFile(this.join(file.path), content);
-        await git.add({ ...this.base(), filepath: file.path });
+      const side = byPath.get(file.path) === "mine" ? file.ours : file.theirs;
+      if (side.state === "unreadable") {
+        throw new Error(
+          `Cannot resolve ${file.path}: the chosen version could not be read (${side.error}). ` +
+            `Nothing was changed.`,
+        );
       }
     }
 
-    // Bring in every non-conflicting remote change too.
+    // Start from our tree, then apply each decision explicitly.
+    for (const file of pending.files) {
+      const side = byPath.get(file.path) === "mine" ? file.ours : file.theirs;
+      await this.materialise(file.path, side);
+    }
+
+    // Bring in every non-conflicting remote change too. Compare blob oids rather
+    // than content so binaries are never decoded on this path either.
     const remoteFiles = this.exclude.filter(
       await git.listFiles({ ...this.base(), ref: pending.theirHead }),
     );
     const conflictPaths = new Set(pending.files.map((f) => f.path));
     for (const path of remoteFiles) {
       if (conflictPaths.has(path)) continue;
-      const ours = await this.readAtCommit(pending.ourHead, path);
+      const [oursOid, theirsOid] = await Promise.all([
+        this.blobOid(pending.ourHead, path),
+        this.blobOid(pending.theirHead, path),
+      ]);
+      if (theirsOid === null || oursOid === theirsOid) continue;
       const theirs = await this.readAtCommit(pending.theirHead, path);
-      if (ours === theirs || theirs === null) continue;
-      await (this.fs as unknown as {
-        promises: { writeFile(p: string, d: string): Promise<void> };
-      }).promises.writeFile(this.join(path), theirs);
-      await git.add({ ...this.base(), filepath: path });
+      if (theirs.state === "unreadable") {
+        throw new Error(
+          `Cannot apply the remote version of ${path} (${theirs.error}). Nothing was changed.`,
+        );
+      }
+      await this.materialise(path, theirs);
     }
 
     const oid = await git.commit({
@@ -2629,6 +2762,40 @@ Then add these methods to the class:
     this.pending = null;
     this.log(`merge: resolved and committed ${oid.slice(0, 7)}`);
     return oid;
+  }
+
+  /**
+   * Writes one decided side to the working tree and stages it.
+   *
+   * Text is written as a string and binary as bytes; a binary file must never go
+   * through a string, or the attachment is corrupted. `absent` means the chosen
+   * side deleted the file, so the deletion is what gets staged.
+   */
+  private async materialise(filepath: string, side: ConflictSide): Promise<void> {
+    const fs = this.fs as unknown as {
+      promises: {
+        writeFile(p: string, d: string | Uint8Array): Promise<void>;
+        unlink(p: string): Promise<void>;
+      };
+    };
+
+    if (side.state === "absent") {
+      try {
+        await fs.promises.unlink(this.join(filepath));
+      } catch {
+        // Already gone from the working tree.
+      }
+      await git.remove({ ...this.base(), filepath });
+      return;
+    }
+    if (side.state === "unreadable") {
+      // Callers must screen this out before reaching here.
+      throw new Error(`Refusing to write unreadable content for ${filepath}`);
+    }
+
+    const data = side.state === "text" ? side.content : side.bytes;
+    await fs.promises.writeFile(this.join(filepath), data);
+    await git.add({ ...this.base(), filepath });
   }
 
   /** Absolute path for the fs adapter, honouring an empty vault-root dir. */
@@ -2868,6 +3035,16 @@ Add these methods to the class:
 Add this module-private helper at the bottom of the file, outside the class:
 
 ```ts
+/** True when a git read failed because the path is not in that tree. */
+function isNotFound(err: unknown): boolean {
+  const code = (err as { code?: string })?.code;
+  return code === "NotFoundError" || code === "ENOENT";
+}
+
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /** Compares remote URLs ignoring a trailing .git and case. */
 function sameRepo(a: string, b: string): boolean {
   const norm = (u: string) => u.trim().replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();
@@ -2939,8 +3116,13 @@ describe("SyncService.sync", () => {
     const g = fakeGit({
       mergeSafe: vi.fn(async (): Promise<MergeOutcome> => ({
         kind: "conflict",
-        reason: "file-conflict",
-        files: [{ path: "a.md", ours: "x", theirs: "y" }],
+        files: [
+          {
+            path: "a.md",
+            ours: { state: "text", content: "x" },
+            theirs: { state: "text", content: "y" },
+          },
+        ],
       })),
     });
     const report = await new SyncService(g as never, () => "msg").sync();
@@ -2948,6 +3130,22 @@ describe("SyncService.sync", () => {
     expect(g.push).not.toHaveBeenCalled();
     expect(report.success).toBe(false);
     expect(report.conflicts.map((c) => c.path)).toEqual(["a.md"]);
+    expect(report.steps.find((s) => s.name === "push")?.result).toBe("skipped");
+  });
+
+  it("does not push when the histories cannot be merged", async () => {
+    const g = fakeGit({
+      mergeSafe: vi.fn(async (): Promise<MergeOutcome> => ({
+        kind: "unmergeable",
+        reason: "unrelated-histories",
+      })),
+    });
+    const report = await new SyncService(g as never, () => "msg").sync();
+
+    expect(g.push).not.toHaveBeenCalled();
+    expect(report.success).toBe(false);
+    expect(report.conflicts).toEqual([]);
+    expect(report.steps.find((s) => s.name === "merge")?.detail).toMatch(/no history/i);
     expect(report.steps.find((s) => s.name === "push")?.result).toBe("skipped");
   });
 
@@ -3014,9 +3212,9 @@ Expected: FAIL — cannot resolve `../../src/sync/sync-service`.
 import type { SafeGit } from "../git/safe-git";
 import type {
   ConflictFile,
-  ConflictReason,
   SyncReport,
   SyncStep,
+  UnmergeableReason,
 } from "../types";
 
 /**
@@ -3091,7 +3289,14 @@ export class SyncService {
           steps.push({
             name: "merge",
             result: "failed",
-            detail: describeConflict(outcome.reason, outcome.files.length),
+            detail: `${outcome.files.length} file(s) conflict — nothing was written`,
+          });
+        } else if (outcome.kind === "unmergeable") {
+          conflicted = true;
+          steps.push({
+            name: "merge",
+            result: "failed",
+            detail: describeUnmergeable(outcome.reason),
           });
         } else {
           steps.push({ name: "merge", result: "ok", detail: outcome.kind });
@@ -3106,7 +3311,10 @@ export class SyncService {
         steps.push({
           name: "push",
           result: "skipped",
-          detail: "resolve the conflict first",
+          detail:
+            conflicts.length > 0
+              ? "resolve the conflict first"
+              : "the histories could not be merged",
         });
         return this.finish(steps, conflicts, logs);
       }
@@ -3145,14 +3353,10 @@ function message(err: unknown): string {
   return String(err);
 }
 
-function describeConflict(reason: ConflictReason, count: number): string {
-  if (reason === "unrelated-histories") {
-    return "local and remote share no history — stopped without changing anything";
-  }
-  if (reason === "multiple-merge-bases") {
-    return "history diverged in a way the git engine cannot merge — stopped safely";
-  }
-  return `${count} file(s) conflict — nothing was written`;
+function describeUnmergeable(reason: UnmergeableReason): string {
+  return reason === "unrelated-histories"
+    ? "local and remote share no history — stopped without changing anything"
+    : "history diverged in a way the git engine cannot merge — stopped safely";
 }
 ```
 
@@ -3415,7 +3619,7 @@ git commit -m "feat: on-screen log modal for mobile diagnostics"
 
 ```ts
 import { App, Modal } from "obsidian";
-import type { ConflictFile } from "../types";
+import type { ConflictFile, ConflictSide } from "../types";
 import type { ConflictResolution } from "../git/safe-git";
 
 /**
@@ -3462,6 +3666,8 @@ export class ConflictModal extends Modal {
 
       const mine = row.createEl("button", { text: describe("Keep mine", file.ours) });
       const theirs = row.createEl("button", { text: describe("Keep theirs", file.theirs) });
+      if (file.ours.state === "unreadable") mine.disabled = true;
+      if (file.theirs.state === "unreadable") theirs.disabled = true;
 
       const paint = () => {
         const c = this.choices.get(file.path);
@@ -3492,10 +3698,30 @@ export class ConflictModal extends Modal {
   }
 }
 
-function describe(label: string, content: string | null): string {
-  if (content === null) return `${label} (deleted)`;
-  const lines = content.split("\n").length;
-  return `${label} (${lines} line${lines === 1 ? "" : "s"})`;
+/**
+ * Summarises a side without ever rendering raw bytes. A binary attachment gets a
+ * size, which is more useful than a wall of replacement characters would be, and
+ * an unreadable side says so plainly rather than looking like an empty file.
+ */
+function describe(label: string, side: ConflictSide): string {
+  switch (side.state) {
+    case "absent":
+      return `${label} (deleted)`;
+    case "text": {
+      const lines = side.content.split("\n").length;
+      return `${label} (${lines} line${lines === 1 ? "" : "s"})`;
+    }
+    case "binary":
+      return `${label} (binary, ${formatBytes(side.bytes.byteLength)})`;
+    case "unreadable":
+      return `${label} (unreadable)`;
+  }
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 ```
 
@@ -3837,6 +4063,7 @@ import {
   DEFAULT_BRANCH,
   DEFAULT_COMMIT_TEMPLATE,
   DEFAULT_EXCLUDES,
+  TIMESTAMP_TOKEN,
   repoUrl,
 } from "./constants";
 import { compileExcludes } from "./git/exclude";
@@ -3949,7 +4176,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
   private commitMessage(): string {
     return this.settings.commitMessageTemplate.replace(
-      "{{timestamp}}",
+      TIMESTAMP_TOKEN,
       new Date().toLocaleString(),
     );
   }
@@ -4016,7 +4243,7 @@ export default class GitHubSyncPlugin extends Plugin {
       new Notice(err instanceof Error ? err.message : String(err));
       return;
     }
-    report.logs.push(...this.logLines);
+    for (const line of this.logLines) report.logs.push(line);
     this.lastReport = report;
 
     if (report.conflicts.length > 0) {
@@ -4084,6 +4311,15 @@ export default class GitHubSyncPlugin extends Plugin {
             new Notice("Conflict left unresolved. Nothing was changed.");
           },
         ).open();
+        return;
+      }
+      if (outcome.kind === "unmergeable") {
+        const detail =
+          outcome.reason === "unrelated-histories"
+            ? "This vault and the remote share no history, so they cannot be merged here."
+            : "The history diverged in a way the git engine cannot merge.";
+        new Notice(`${detail} Nothing was changed.`, 15000);
+        new LogModal(this.app, "Cannot merge", [...this.logLines, "", detail]).open();
         return;
       }
       new Notice(`Pull: ${outcome.kind}`);

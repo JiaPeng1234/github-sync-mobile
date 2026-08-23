@@ -152,8 +152,12 @@ trustworthy enough to lean on.
 
 **Defaults (excluded out of the box):** `.obsidian/`, `.git/`, `.trash/`.
 
-**UI:** a few friendly toggles ("Sync plugin config?", "Sync themes?") defaulting to off,
+**UI:** a single toggle for syncing `.obsidian/` (default off, and warned about — see below),
 with a raw glob list under *Advanced*.
+
+Per-item toggles such as "Sync themes?" are **not** offered. Themes live inside `.obsidian/`,
+and the exclude grammar has no negation, so "exclude `.obsidian/` except themes" is not
+expressible. Offering the toggle would imply a capability the engine does not have.
 
 **Enforced at every touchpoint:** clone-checkout, staging, status computation,
 merge-checkout, push.
@@ -240,6 +244,15 @@ Conflict detected → abort merge; working tree byte-identical; local commit saf
 This is safe because **both versions already exist in git history** — the losing side is
 postponed, never destroyed. Whole-file choice also happens to be the *right* granularity for
 binary attachments (images, PDFs), where line-merging is meaningless.
+
+For that to actually hold, a conflicting side is carried as **bytes, not a string**. Decoding a
+blob to text is lossy — a non-fatal decoder replaces every invalid UTF-8 byte with U+FFFD — so
+carrying an attachment as a string and writing it back would silently corrupt it and commit the
+damage. A side is therefore one of: absent (that side deleted it), text, binary, or
+**unreadable**. The last is deliberately distinct from absent: a failed blob read (a torn
+packfile after iOS killed the app mid-write, or an out-of-memory on a large attachment) must
+never be mistaken for a deletion, because resolution acts on absent by deleting and committing.
+An unreadable side is refused before anything is written.
 
 It is additionally immune to a whole class of engine bug: isomorphic-git once corrupted every
 binary file in the working directory on merge conflict (#2379, since fixed). Because we never
