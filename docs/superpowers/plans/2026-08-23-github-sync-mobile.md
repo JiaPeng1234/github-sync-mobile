@@ -716,7 +716,7 @@ function normalise(p: string): string {
   return out.replace(/\/{2,}/g, "/");
 }
 
-const DOUBLE_STAR = " ";
+const DOUBLE_STAR = "\u0000";
 
 function toRegExp(rawPattern: string): RegExp {
   let p = normalise(rawPattern);
