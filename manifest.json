@@ -1,0 +1,10 @@
+{
+  "id": "github-sync-mobile",
+  "name": "GitHub Sync Mobile",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Manually sync your vault to your own private GitHub repo, designed for mobile. Never overwrites your notes without asking.",
+  "author": "Peng Jia",
+  "authorUrl": "https://github.com/JiaPeng1234",
+  "isDesktopOnly": false
+}

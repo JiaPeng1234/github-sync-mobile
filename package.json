@@ -1,0 +1,25 @@
+{
+  "name": "github-sync-mobile",
+  "version": "0.1.0",
+  "description": "Manual, safe GitHub sync for Obsidian on mobile",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "isomorphic-git": "^1.41.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "latest",
+    "tslib": "^2.6.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.6.0"
+  }
+}
