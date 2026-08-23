@@ -5,46 +5,84 @@ export interface StatResult {
   size: number;
 }
 
+interface StoredFile {
+  data: Uint8Array;
+  ctime: number;
+  mtime: number;
+}
+
+/**
+ * ENOENT carrying a `code` property, like Node's fs errors.
+ *
+ * The code is load-bearing, not decorative: isomorphic-git's write helper catches a
+ * failed write, calls `mkdir` on the parent, and retries, and it keys that recovery on
+ * the error code rather than the message.
+ */
+function enoent(message: string): Error {
+  const e = new Error(`ENOENT: ${message}`) as Error & { code: string };
+  e.code = "ENOENT";
+  return e;
+}
+
 /** In-memory stand-in for Obsidian's DataAdapter. */
 export class MemoryAdapter {
-  private files = new Map<string, Uint8Array>();
+  private files = new Map<string, StoredFile>();
   private folders = new Set<string>();
+
+  /**
+   * Deterministic stand-in for wall-clock time, so mtimes are reproducible across runs.
+   * Advanced by writes only -- never by stat, which must be side-effect free.
+   */
   private clock = 1000;
 
-  private touch(): number {
+  private tick(): number {
     return (this.clock += 1000);
   }
 
-  private ensureParents(path: string): void {
-    const parts = path.split("/");
-    parts.pop();
-    let acc = "";
-    for (const p of parts) {
-      acc = acc ? `${acc}/${p}` : p;
-      if (acc) this.folders.add(acc);
+  private parentOf(path: string): string {
+    const i = path.lastIndexOf("/");
+    return i === -1 ? "" : path.slice(0, i);
+  }
+
+  /**
+   * The real adapter does not create missing parent folders on write: desktop
+   * (fs.writeFile) and mobile (Capacitor) both fail with ENOENT. Mirroring that
+   * strictness is deliberate -- a lenient write path here would let a filesystem
+   * bridge that forgets to mkdir pass its tests and then fail on a phone, which is
+   * the one place this project's users cannot inspect or repair anything.
+   */
+  private requireParent(path: string): void {
+    const parent = this.parentOf(path);
+    if (parent !== "" && !this.folders.has(parent)) {
+      throw enoent(`no such folder '${parent}' to write '${path}' into`);
     }
   }
 
+  private put(path: string, data: Uint8Array): void {
+    this.requireParent(path);
+    const now = this.tick();
+    const existing = this.files.get(path);
+    this.files.set(path, { data, ctime: existing ? existing.ctime : now, mtime: now });
+  }
+
   async write(path: string, data: string): Promise<void> {
-    this.ensureParents(path);
-    this.files.set(path, new TextEncoder().encode(data));
+    this.put(path, new TextEncoder().encode(data));
   }
 
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-    this.ensureParents(path);
-    this.files.set(path, new Uint8Array(data.slice(0)));
+    this.put(path, new Uint8Array(data.slice(0)));
   }
 
   async read(path: string): Promise<string> {
-    const b = this.files.get(path);
-    if (!b) throw new Error(`ENOENT: ${path}`);
-    return new TextDecoder().decode(b);
+    const f = this.files.get(path);
+    if (!f) throw enoent(path);
+    return new TextDecoder().decode(f.data);
   }
 
   async readBinary(path: string): Promise<ArrayBuffer> {
-    const b = this.files.get(path);
-    if (!b) throw new Error(`ENOENT: ${path}`);
-    return b.slice().buffer;
+    const f = this.files.get(path);
+    if (!f) throw enoent(path);
+    return f.data.slice().buffer;
   }
 
   async exists(path: string): Promise<boolean> {
@@ -52,9 +90,9 @@ export class MemoryAdapter {
   }
 
   async stat(path: string): Promise<StatResult | null> {
-    if (this.files.has(path)) {
-      const size = this.files.get(path)!.byteLength;
-      return { type: "file", ctime: 1000, mtime: this.touch(), size };
+    const f = this.files.get(path);
+    if (f) {
+      return { type: "file", ctime: f.ctime, mtime: f.mtime, size: f.data.byteLength };
     }
     if (this.folders.has(path) || path === "") {
       return { type: "folder", ctime: 1000, mtime: 1000, size: 0 };
@@ -83,9 +121,13 @@ export class MemoryAdapter {
     return { files: files.sort(), folders: [...folders].sort() };
   }
 
+  /** Creates intermediate parents, so callers can set up a tree in one call. */
   async mkdir(path: string): Promise<void> {
-    this.ensureParents(`${path}/x`);
-    this.folders.add(path);
+    let acc = "";
+    for (const p of path.split("/")) {
+      acc = acc ? `${acc}/${p}` : p;
+      if (acc) this.folders.add(acc);
+    }
   }
 
   async rmdir(path: string, recursive: boolean): Promise<void> {
@@ -98,7 +140,7 @@ export class MemoryAdapter {
   }
 
   async remove(path: string): Promise<void> {
-    if (!this.files.delete(path)) throw new Error(`ENOENT: ${path}`);
+    if (!this.files.delete(path)) throw enoent(path);
   }
 
   /** Test helper: snapshot of every file path currently present. */
