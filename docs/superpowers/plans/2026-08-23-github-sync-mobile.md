@@ -857,7 +857,7 @@ import { MemoryAdapter } from "../mocks/memory-adapter";
 
 function setup(base = "") {
   const adapter = new MemoryAdapter();
-  const fs = createFs(adapter as never, base);
+  const fs = createFs(adapter, base);
   return { adapter, fs: fs.promises };
 }
 
@@ -992,6 +992,28 @@ Expected: FAIL — cannot resolve `../../src/git/fs-adapter`.
 ```ts
 import type { DataAdapter } from "obsidian";
 
+/**
+ * Exactly the DataAdapter surface this bridge is allowed to touch.
+ *
+ * Naming the subset keeps the contract load-bearing: the in-memory adapter used
+ * in tests satisfies this type structurally, so no cast is needed at the seam,
+ * and a bridge that reached for some other DataAdapter member would fail to
+ * compile rather than pass its tests and break on a device.
+ */
+export type VaultAdapter = Pick<
+  DataAdapter,
+  | "read"
+  | "readBinary"
+  | "write"
+  | "writeBinary"
+  | "exists"
+  | "stat"
+  | "list"
+  | "mkdir"
+  | "rmdir"
+  | "remove"
+>;
+
 interface StatsLike {
   type: "file" | "dir";
   size: number;
@@ -1056,7 +1078,7 @@ function wantsText(options: unknown): boolean {
  * `base` is the vault's absolute path on desktop and "" on mobile. All paths
  * handed to the adapter must be vault-relative.
  */
-export function createFs(adapter: DataAdapter, base: string) {
+export function createFs(adapter: VaultAdapter, base: string) {
   const normBase = base.replace(/\\/g, "/").replace(/\/+$/, "");
 
   const rel = (abs: string): string => {
@@ -1399,7 +1421,7 @@ export async function makeHarness(
   excludes: string[] = [".obsidian/", ".git/", ".trash/"],
 ): Promise<Harness> {
   const adapter = new MemoryAdapter();
-  const fs = createFs(adapter as never, "");
+  const fs = createFs(adapter, "");
   const dir = "";
 
   const safeGit = new SafeGit({
