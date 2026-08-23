@@ -78,6 +78,8 @@ all: we create a local `refs/remotes/origin/main` ref by hand to simulate a fetc
   "version": "0.1.0",
   "description": "Manual, safe GitHub sync for Obsidian on mobile",
   "main": "main.js",
+  "license": "GPL-3.0",
+  "private": true,
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc --noEmit && node esbuild.config.mjs production",
@@ -93,7 +95,6 @@ all: we create a local `refs/remotes/origin/main` ref by hand to simulate a fetc
     "@types/node": "^20.0.0",
     "esbuild": "^0.20.0",
     "obsidian": "latest",
-    "tslib": "^2.6.0",
     "typescript": "^5.3.0",
     "vitest": "^1.6.0"
   }
@@ -106,17 +107,16 @@ all: we create a local `refs/remotes/origin/main` ref by hand to simulate a fetc
 {
   "compilerOptions": {
     "baseUrl": ".",
-    "inlineSourceMap": true,
-    "inlineSources": true,
+    "noEmit": true,
     "module": "ESNext",
     "target": "ES2018",
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "moduleResolution": "node",
-    "importHelpers": true,
     "isolatedModules": true,
     "strict": true,
     "noImplicitOverride": true,
+    "skipLibCheck": true,
     "lib": ["ES2018", "DOM"],
     "types": ["node", "vitest/globals"]
   },
@@ -132,6 +132,14 @@ isomorphic-git's dependencies (`readable-stream`, `sha.js`, `pako`, `crc-32`) ne
 ```js
 // Mobile (iOS/Android) has no Node `buffer` builtin and no `Buffer` global.
 // isomorphic-git's deps require both. esbuild injects this into every module.
+//
+// CONSTRAINT for the filesystem adapter: esbuild's `inject` rewrites the bare
+// identifier `Buffer` at every bundled call site on every platform, so on desktop
+// this polyfill coexists with (and shadows) Node's native Buffer. The polyfill's
+// `Buffer.isBuffer(b)` tests `b._isBuffer === true`, which is false for a native
+// Node Buffer -- and isomorphic-git's GitIndex calls `Buffer.isBuffer(...)`. So the
+// fs adapter MUST always return `Uint8Array` and never a native Node Buffer.
+// This is a hard correctness requirement, not a stylistic preference.
 import { Buffer } from "buffer";
 
 if (typeof globalThis.Buffer === "undefined") {
@@ -146,18 +154,18 @@ export { Buffer };
 ```js
 import esbuild from "esbuild";
 import process from "process";
-import { builtinModules } from "module";
 
 const prod = process.argv[2] === "production";
 
-// Node builtins stay external (Electron provides them on desktop) EXCEPT `buffer`,
-// which must be bundled because mobile has no Node runtime. See buffer-shim.mjs.
-const externalBuiltins = builtinModules.filter((m) => m !== "buffer");
-
-await esbuild.build({
+const options = {
   banner: { js: "/* github-sync-mobile */" },
   entryPoints: ["src/main.ts"],
   bundle: true,
+  // Only the modules Obsidian itself provides at runtime are external.
+  // Node builtins are deliberately NOT listed: mobile has no Node runtime, so a
+  // `require("crypto")` in the bundle would work on desktop Electron and crash on
+  // iOS. Leaving builtins un-external makes such an import fail the build here
+  // instead of failing on someone's phone.
   external: [
     "obsidian",
     "electron",
@@ -172,8 +180,11 @@ await esbuild.build({
     "@lezer/common",
     "@lezer/highlight",
     "@lezer/lr",
-    ...externalBuiltins,
   ],
+  // Load-bearing for iOS: `browser` makes isomorphic-git's `exports` map resolve
+  // its browser entry (index.js) rather than the `node` condition (index.cjs,
+  // which requires `crypto` and `path`). Switching this to "node" breaks mobile.
+  platform: "browser",
   inject: ["buffer-shim.mjs"],
   format: "cjs",
   target: "es2018",
@@ -182,7 +193,14 @@ await esbuild.build({
   treeShaking: true,
   outfile: "main.js",
   minify: prod,
-});
+};
+
+if (prod) {
+  await esbuild.build(options);
+} else {
+  const ctx = await esbuild.context(options);
+  await ctx.watch();
+}
 ```
 
 - [ ] **Step 5: Create `manifest.json`**
