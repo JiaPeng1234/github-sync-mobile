@@ -12,6 +12,18 @@
 
 ---
 
+## Compiler setting that affects every UI task
+
+`tsconfig.json` sets **`noImplicitOverride: true`**. Any method that overrides a concrete
+member of an Obsidian base class must therefore carry the `override` keyword, or the build
+fails with TS4114. This applies to `Plugin.onload`/`onunload`, `Modal.onOpen`/`onClose`,
+`PluginSettingTab.display`, and the `ItemView` lifecycle methods.
+
+The code blocks in Tasks 14–18 include `override` where it is required. If `npx tsc --noEmit`
+reports TS4114 on a member that does not have it, add the keyword — and if it reports TS4113
+("this member cannot have an override modifier because it is not declared in the base class"),
+remove it. Let the compiler settle the exact set rather than guessing.
+
 ## Testing philosophy for this project
 
 Read this before starting — it determines whether the tests are worth anything.
@@ -3221,7 +3233,7 @@ export class LogModal extends Modal {
     return new LogModal(app, report.success ? "Sync complete" : "Sync stopped", lines);
   }
 
-  onOpen(): void {
+  override onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h3", { text: this.title });
@@ -3242,7 +3254,7 @@ export class LogModal extends Modal {
     };
   }
 
-  onClose(): void {
+  override onClose(): void {
     this.contentEl.empty();
   }
 }
@@ -3292,7 +3304,7 @@ export class ConflictModal extends Modal {
 
   private resolved = false;
 
-  onOpen(): void {
+  override onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h3", { text: `Resolve ${this.files.length} conflict(s)` });
@@ -3341,7 +3353,7 @@ export class ConflictModal extends Modal {
     };
   }
 
-  onClose(): void {
+  override onClose(): void {
     this.contentEl.empty();
     // Dismissing without deciding must leave the repo untouched.
     if (!this.resolved) this.onAbandon();
@@ -3390,7 +3402,7 @@ export class SettingsTab extends PluginSettingTab {
     super(app, plugin);
   }
 
-  display(): void {
+  override display(): void {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "GitHub Sync Mobile" });
@@ -3591,19 +3603,19 @@ export class SyncView extends ItemView {
     super(leaf);
   }
 
-  getViewType(): string {
+  override getViewType(): string {
     return SYNC_VIEW_TYPE;
   }
 
-  getDisplayText(): string {
+  override getDisplayText(): string {
     return "GitHub Sync";
   }
 
-  getIcon(): string {
+  override getIcon(): string {
     return "refresh-cw";
   }
 
-  async onOpen(): Promise<void> {
+  override async onOpen(): Promise<void> {
     const root = this.contentEl;
     root.empty();
     root.style.padding = "12px";
@@ -3722,7 +3734,7 @@ export default class GitHubSyncPlugin extends Plugin {
   private lastReport: SyncReport | null = null;
   private logLines: string[] = [];
 
-  async onload(): Promise<void> {
+  override async onload(): Promise<void> {
     await this.loadSettings();
 
     this.addSettingTab(new SettingsTab(this.app, this));
@@ -3750,7 +3762,7 @@ export default class GitHubSyncPlugin extends Plugin {
     });
   }
 
-  async onunload(): Promise<void> {
+  override async onunload(): Promise<void> {
     // Nothing to flush: sync only ever runs on explicit user action.
   }
 
