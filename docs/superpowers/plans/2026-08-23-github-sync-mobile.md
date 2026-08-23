@@ -1201,6 +1201,25 @@ Routes every git request through Obsidian's `requestUrl`, which is not subject t
 CORS. This is what removes the need for a third-party CORS proxy — important because a proxy
 would see the contents of a private vault.
 
+### Two `requestUrl` rules that apply to every network task (6 and 13)
+
+Both come from the test harness having a deliberately narrower stub than the real API, so
+violating either would pass tests and behave differently on a device.
+
+1. **Always `await` the call, then read properties off the result.** The real API also allows
+   `await requestUrl(p).json` — awaiting a *property* of the returned promise object. The stub
+   does not model that form: it returns a plain promise, so `.json` reads as `undefined` in every
+   test while working on a phone. Code written that way typechecks (because `tsc` resolves
+   `obsidian` in `src/` to the real package) and silently takes the wrong branch under test.
+   Use `const res = await requestUrl({...})` and then `res.status` / `res.text` /
+   `res.arrayBuffer` / `res.headers`.
+2. **Pass `throw: false` and inspect the status yourself; never rely on a thrown error carrying
+   a status.** The real `requestUrl` throws on 400+ unless `throw: false`, and the typings promise
+   no `status` property on that error. The stub attaches one for convenience, so keying a decision
+   on `err.status` would work in tests and read `undefined` in production. Git and the GitHub API
+   both need to see 401/403/404/409 as ordinary responses, which is exactly why both clients pass
+   `throw: false`.
+
 **Files:**
 - Create: `src/git/http-client.ts`
 - Test: `tests/git/http-client.test.ts`
