@@ -811,8 +811,24 @@ git commit -m "feat: exclude engine with recursive directory semantics"
 
 ## Task 5: Filesystem adapter
 
-Bridges Obsidian's `DataAdapter` to the `fs.promises` shape isomorphic-git expects. Two
-gotchas here were real bugs in the prior plugin and are covered by tests:
+Bridges Obsidian's `DataAdapter` to the `fs.promises` shape isomorphic-git expects.
+
+Three constraints inherited from earlier tasks, all load-bearing:
+
+- **Never produce a native Node `Buffer`.** esbuild's `inject` shadows the `Buffer` identifier
+  on every platform, and the polyfill's `Buffer.isBuffer` tests `_isBuffer === true`, which is
+  false for a native Buffer — while isomorphic-git's GitIndex calls `Buffer.isBuffer(...)`.
+  Return `Uint8Array` from `readFile` and stay on `Uint8Array`/`ArrayBuffer` throughout.
+- **Hand `writeBinary` an exact-size `ArrayBuffer`.** `writeBinary` stores the whole underlying
+  buffer, so passing `someView.buffer` for a subarray silently writes trailing garbage.
+  `new Uint8Array(data)` then `.buffer` is exact-size and correct; do not "optimise" the copy away.
+- **Do not silently create parent directories on write.** The adapter refuses, matching the real
+  one. isomorphic-git recovers on its own by mkdir-ing the parent and retrying, so propagate the
+  error (with `code: "ENOENT"`) instead of masking it. If a needed `mkdir` were hidden here, the
+  omission would only ever surface on a phone. **If real isomorphic-git turns out not to recover,
+  report it — do not loosen the adapter.**
+
+Two further gotchas were real bugs in the prior plugin and are covered by tests:
 
 1. The vault root must map to `""`. Obsidian's adapter treats `""` as the root; passing the
    absolute base path instead makes `list()` look for a subfolder named after the vault, which
@@ -870,6 +886,7 @@ describe("fs-adapter", () => {
 
   it("strips the base prefix from nested absolute paths", async () => {
     const { adapter, fs } = setup("/vault");
+    await adapter.mkdir("notes");
     await adapter.write("notes/a.md", "x");
     expect(await fs.readFile("/vault/notes/a.md", "utf8")).toBe("x");
   });
@@ -888,6 +905,7 @@ describe("fs-adapter", () => {
 
   it("reports files and directories through stat", async () => {
     const { fs } = setup();
+    await fs.mkdir("dir");
     await fs.writeFile("dir/a.md", "x");
     const fileStat = await fs.stat("dir/a.md");
     expect(fileStat.isFile()).toBe(true);
@@ -898,9 +916,23 @@ describe("fs-adapter", () => {
 
   it("lists only immediate children as bare names", async () => {
     const { fs } = setup();
+    await fs.mkdir("dir");
     await fs.writeFile("dir/a.md", "x");
+    await fs.mkdir("dir/sub");
     await fs.writeFile("dir/sub/b.md", "y");
     expect((await fs.readdir("dir")).sort()).toEqual(["a.md", "sub"]);
+  });
+
+  // The adapter refuses to invent parent folders, exactly like the real one.
+  // isomorphic-git recovers from this itself (it catches the failed write, mkdirs
+  // the parent, and retries), so the bridge must propagate the error rather than
+  // hiding it behind an implicit mkdir -- otherwise a missing mkdir would only
+  // ever surface on a phone.
+  it("propagates ENOENT when the parent directory does not exist", async () => {
+    const { fs } = setup();
+    await expect(fs.writeFile("missing/a.md", "x")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("deletes a file with unlink", async () => {
