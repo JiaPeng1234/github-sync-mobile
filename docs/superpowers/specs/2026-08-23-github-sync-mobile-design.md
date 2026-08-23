@@ -254,9 +254,14 @@ packfile after iOS killed the app mid-write, or an out-of-memory on a large atta
 never be mistaken for a deletion, because resolution acts on absent by deleting and committing.
 An unreadable side is refused before anything is written.
 
-It is additionally immune to a whole class of engine bug: isomorphic-git once corrupted every
-binary file in the working directory on merge conflict (#2379, since fixed). Because we never
-let the engine write a half-merged tree, that class of failure cannot reach the vault.
+**Binary files are never merged by content.** isomorphic-git's own merge decodes both sides with
+a non-fatal UTF-8 conversion and re-encodes the result, so letting it merge a binary silently
+corrupts it — and because the three-way algorithm usually finds separable regions in a large
+file, it would report a *clean* merge and never ask. The plugin therefore installs a merge driver
+that refuses any file whose content does not survive a strict UTF-8 round trip, routing it to the
+conflict path instead, where both versions are carried as bytes and the user chooses whole-file.
+A text file that genuinely contains U+FFFD is also routed there; a needless question is an
+acceptable price for never corrupting an attachment.
 
 **Phase 2** adds line-level resolution (diff3, conflict markers) on top of this seam without
 redesigning phase 1.

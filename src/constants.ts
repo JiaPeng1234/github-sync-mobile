@@ -42,10 +42,15 @@ export const COMMIT_AUTHOR: { readonly name: string; readonly email: string } = 
 export const GITHUB_API = "https://api.github.com";
 
 /**
- * Owner, repo, and branch names the plugin is willing to interpolate into a URL
- * or a ref. Deliberately strict: these come straight from text fields, and on iOS
- * a malformed value produces a confusing failure the user has no way to inspect.
- * Rejecting it early lets the caller name the offending field instead.
+ * Owner and repository names the plugin is willing to interpolate into a URL.
+ * Deliberately strict: these come straight from text fields, and on iOS a
+ * malformed value produces a confusing failure the user has no way to inspect.
+ *
+ * Not applicable to branch names — a branch may legitimately contain `/`, as in
+ * `feature/x`, so applying this to a branch would reject valid input.
+ *
+ * Callers must catch the errors `repoUrl` throws and name the offending field;
+ * an unhandled throw here would leave the UI silently inert.
  */
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
 
