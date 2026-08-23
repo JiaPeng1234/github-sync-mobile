@@ -150,4 +150,81 @@ describe("MemoryAdapter", () => {
     expect(st.mtime).toBe(st.ctime);
     expect(st.mtime).toBeGreaterThan(1000);
   });
+
+  it("reports existence for files, folders, and the vault root", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("d");
+    await a.write("d/f.md", "x");
+    expect(await a.exists("d/f.md")).toBe(true);
+    expect(await a.exists("d")).toBe(true);
+    expect(await a.exists("")).toBe(true);
+    expect(await a.exists("nope")).toBe(false);
+  });
+
+  it("copies binary data in and out so callers cannot mutate stored bytes", async () => {
+    const a = new MemoryAdapter();
+    const source = new Uint8Array([1, 2, 3]);
+    await a.writeBinary("b.bin", source.buffer);
+
+    // Inbound copy: isomorphic-git may reuse a buffer after handing it to us.
+    source[0] = 99;
+    expect(Array.from(new Uint8Array(await a.readBinary("b.bin")))).toEqual([1, 2, 3]);
+
+    // Outbound copy: a caller mutating what it read must not corrupt the store.
+    const out = await a.readBinary("b.bin");
+    new Uint8Array(out)[0] = 42;
+    expect(Array.from(new Uint8Array(await a.readBinary("b.bin")))).toEqual([1, 2, 3]);
+  });
+
+  it("refuses to write over a folder, keeping files and folders disjoint", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("dir");
+    await expect(a.write("dir", "clobber")).rejects.toMatchObject({ code: "EISDIR" });
+    await expect(
+      a.writeBinary("dir", new Uint8Array([1]).buffer),
+    ).rejects.toMatchObject({ code: "EISDIR" });
+
+    expect((await a.stat("dir"))?.type).toBe("folder");
+    expect(a.paths()).toEqual([]);
+  });
+
+  it("refuses to mkdir at or underneath a file, keeping files and folders disjoint", async () => {
+    const a = new MemoryAdapter();
+    await a.write("f.md", "x");
+    await expect(a.mkdir("f.md")).rejects.toMatchObject({ code: "ENOTDIR" });
+    await expect(a.mkdir("f.md/sub")).rejects.toMatchObject({ code: "ENOTDIR" });
+
+    // Regression: a failed mkdir must not retract the ENOTDIR that list() owes us,
+    // and must not leave a partially created tree behind.
+    await expect(a.list("f.md")).rejects.toMatchObject({ code: "ENOTDIR" });
+    expect((await a.stat("f.md"))?.type).toBe("file");
+    expect(await a.list("")).toEqual({ files: ["f.md"], folders: [] });
+  });
+
+  it("removes a subtree recursively and reports an absent folder", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("d/sub");
+    await a.write("d/1.md", "a");
+    await a.write("d/sub/2.md", "b");
+
+    await a.rmdir("d", true);
+
+    expect(a.paths()).toEqual([]);
+    expect(await a.exists("d")).toBe(false);
+    expect(await a.exists("d/sub")).toBe(false);
+    await expect(a.list("d")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(a.rmdir("gone", true)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("allows a non-recursive rmdir of a non-empty folder (deliberate divergence)", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("d");
+    await a.write("d/1.md", "a");
+
+    // The real adapter fails here. Pinned so the leniency stays a visible decision:
+    // it strands the child, which is why callers must pass recursive.
+    await a.rmdir("d", false);
+    expect(await a.exists("d")).toBe(false);
+    expect(a.paths()).toEqual(["d/1.md"]);
+  });
 });

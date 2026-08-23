@@ -1,11 +1,4 @@
-import type { DataAdapter, DataWriteOptions } from "obsidian";
-
-export interface StatResult {
-  type: "file" | "folder";
-  ctime: number;
-  mtime: number;
-  size: number;
-}
+import type { DataAdapter, DataWriteOptions, Stat } from "obsidian";
 
 interface StoredFile {
   data: Uint8Array;
@@ -26,13 +19,38 @@ interface StoredFolder {
  * code rather than the message; its `readdir` converts ENOENT/ENOTDIR into `null` to
  * distinguish "absent or not a directory" from "an empty directory".
  */
-function fsError(code: "ENOENT" | "ENOTDIR", message: string): Error {
+function fsError(code: "ENOENT" | "ENOTDIR" | "EISDIR", message: string): Error {
   const e = new Error(`${code}: ${message}`) as Error & { code: string };
   e.code = code;
   return e;
 }
 
-/** In-memory stand-in for Obsidian's DataAdapter. */
+/**
+ * In-memory stand-in for Obsidian's DataAdapter.
+ *
+ * Invariant: `files` and `folders` have disjoint key sets. One path is a file or a
+ * folder, never both. Every mutating method preserves this, because a path that
+ * answers to both `read` and `list` is a state no real filesystem can reach, and a
+ * safety test running against it would be measuring fiction.
+ *
+ * DELIBERATE DIVERGENCES from the real adapter. Each is an accepted trade-off, not an
+ * oversight -- do not "harden" these without re-reading why:
+ *   - `mkdir` on an existing folder succeeds instead of throwing EEXIST. Load-bearing:
+ *     isomorphic-git's mkdir-and-retry path calls mkdir on parents that usually already
+ *     exist, and making this throw would break that recovery.
+ *   - Non-recursive `rmdir` of a non-empty folder succeeds instead of failing, which
+ *     strands the children. Tolerated because nothing in this plugin relies on the
+ *     failure, and modelling it buys no safety.
+ *   - Paths are case-sensitive, where iOS and macOS vaults are typically
+ *     case-insensitive. A real device would collide two notes differing only in case;
+ *     here they coexist. Modelling this faithfully would mean a whole case-folding
+ *     layer, and no planned test depends on the collision.
+ *   - `remove()` on a folder path throws ENOENT rather than the platform's error, since
+ *     it only ever consults `files`.
+ *   - `list("f.md/sub")` -- a path *under* a file -- gives ENOENT where a real
+ *     filesystem gives ENOTDIR. isomorphic-git collapses both into `null`, so no branch
+ *     changes; distinguishing them would mean walking every ancestor on each call.
+ */
 export class MemoryAdapter {
   private files = new Map<string, StoredFile>();
   private folders = new Map<string, StoredFolder>();
@@ -53,6 +71,17 @@ export class MemoryAdapter {
     return i === -1 ? "" : path.slice(0, i);
   }
 
+  /** Every accumulated prefix of a path, outermost first: "a/b/c" -> a, a/b, a/b/c. */
+  private prefixesOf(path: string): string[] {
+    const out: string[] = [];
+    let acc = "";
+    for (const p of path.split("/")) {
+      acc = acc ? `${acc}/${p}` : p;
+      if (acc) out.push(acc);
+    }
+    return out;
+  }
+
   /**
    * The real adapter does not create missing parent folders on write: desktop
    * (fs.writeFile) and mobile (Capacitor) both fail with ENOENT. Mirroring that
@@ -60,15 +89,15 @@ export class MemoryAdapter {
    * bridge that forgets to mkdir pass its tests and then fail on a phone, which is
    * the one place this project's users cannot inspect or repair anything.
    */
-  private requireParent(path: string): void {
+  private put(path: string, data: Uint8Array, options?: DataWriteOptions): void {
+    if (this.folders.has(path)) {
+      throw fsError("EISDIR", `'${path}' is a folder, not a file`);
+    }
     const parent = this.parentOf(path);
     if (parent !== "" && !this.folders.has(parent)) {
       throw fsError("ENOENT", `no such folder '${parent}' to write '${path}' into`);
     }
-  }
 
-  private put(path: string, data: Uint8Array, options?: DataWriteOptions): void {
-    this.requireParent(path);
     const now = this.tick();
     const existing = this.files.get(path);
     this.files.set(path, {
@@ -106,7 +135,7 @@ export class MemoryAdapter {
     return this.files.has(path) || this.folders.has(path) || path === "";
   }
 
-  async stat(path: string): Promise<StatResult | null> {
+  async stat(path: string): Promise<Stat | null> {
     const f = this.files.get(path);
     if (f) {
       return { type: "file", ctime: f.ctime, mtime: f.mtime, size: f.data.byteLength };
@@ -119,7 +148,8 @@ export class MemoryAdapter {
   }
 
   /**
-   * Non-recursive, returning full vault-relative paths.
+   * Non-recursive, returning full vault-relative paths. `folders` is the single source
+   * of truth for what folders exist -- nothing is inferred from file path prefixes.
    *
    * Throws for a missing path and for a file, as the real adapter does. Returning an
    * empty listing instead would collapse "absent" and "empty" into one answer, and a
@@ -135,37 +165,42 @@ export class MemoryAdapter {
 
     const prefix = path === "" ? "" : `${path}/`;
     const files: string[] = [];
-    const folders = new Set<string>();
+    const folders: string[] = [];
     for (const f of this.files.keys()) {
       if (!f.startsWith(prefix)) continue;
       const rest = f.slice(prefix.length);
-      if (!rest) continue;
-      const slash = rest.indexOf("/");
-      if (slash === -1) files.push(f);
-      else folders.add(prefix + rest.slice(0, slash));
+      if (rest && !rest.includes("/")) files.push(f);
     }
     for (const d of this.folders.keys()) {
       if (!d.startsWith(prefix)) continue;
       const rest = d.slice(prefix.length);
-      if (!rest) continue;
-      if (!rest.includes("/")) folders.add(d);
+      if (rest && !rest.includes("/")) folders.push(d);
     }
-    return { files: files.sort(), folders: [...folders].sort() };
+    return { files: files.sort(), folders: folders.sort() };
   }
 
   /** Creates intermediate parents, so callers can set up a tree in one call. */
   async mkdir(path: string): Promise<void> {
-    let acc = "";
+    const prefixes = this.prefixesOf(path);
+    // Validate the whole chain before creating anything, so a rejected mkdir leaves no
+    // partial tree behind.
+    for (const p of prefixes) {
+      if (this.files.has(p)) {
+        throw fsError("ENOTDIR", `'${p}' is a file, so '${path}' cannot be created`);
+      }
+    }
     let now = 0;
-    for (const p of path.split("/")) {
-      acc = acc ? `${acc}/${p}` : p;
-      if (!acc || this.folders.has(acc)) continue;
+    for (const p of prefixes) {
+      if (this.folders.has(p)) continue;
       if (now === 0) now = this.tick();
-      this.folders.set(acc, { ctime: now, mtime: now });
+      this.folders.set(p, { ctime: now, mtime: now });
     }
   }
 
   async rmdir(path: string, recursive: boolean): Promise<void> {
+    if (!this.folders.has(path)) {
+      throw fsError("ENOENT", `no such folder '${path}'`);
+    }
     this.folders.delete(path);
     if (recursive) {
       const p = `${path}/`;
@@ -186,6 +221,11 @@ export class MemoryAdapter {
 
 // Compile-time guard: the methods we implement must match the real interface.
 // Not a full DataAdapter -- we deliberately omit the members no test needs.
+//
+// Two proven blind spots, so nobody over-trusts this: it does not catch a *dropped
+// optional parameter* (a shorter signature stays assignable) nor a *narrowed return
+// type*. Both are covered by the runtime tests instead -- which is why, for example,
+// DataWriteOptions and the stat/list return shapes have explicit test cases.
 const _conforms: Pick<
   DataAdapter,
   | "read"
