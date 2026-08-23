@@ -47,7 +47,7 @@ all: we create a local `refs/remotes/origin/main` ref by hand to simulate a fetc
 | `manifest.json`, `versions.json` | Obsidian plugin metadata |
 | `vitest.config.ts`, `tests/mocks/obsidian.ts` | test harness + `obsidian` module stub |
 | `tests/mocks/memory-adapter.ts` | in-memory `DataAdapter` used as the test filesystem |
-| `src/types.ts` | `PluginSettings`, `SyncStatus`, `SyncReport`, `ConflictFile`, `MergeOutcome` |
+| `src/types.ts` | `PluginSettings`, `SyncReport`, `SyncStep`, `ConflictFile`, `MergeOutcome` |
 | `src/constants.ts` | default branch, default excludes, commit author, message template |
 | `src/git/exclude.ts` | pattern compiler + matcher; used at every git touchpoint |
 | `src/git/fs-adapter.ts` | Obsidian `DataAdapter` → isomorphic-git `fs.promises` |
@@ -532,13 +532,6 @@ export interface PluginSettings {
   verboseLog: boolean;
   commitMessageTemplate: string;
 }
-
-export type SyncStatus =
-  | "idle"
-  | "syncing"
-  | "conflict"
-  | "error"
-  | "not-connected";
 
 /** A file that differs on both sides and needs a user decision. */
 export interface ConflictFile {
@@ -3019,7 +3012,12 @@ Expected: FAIL — cannot resolve `../../src/sync/sync-service`.
 
 ```ts
 import type { SafeGit } from "../git/safe-git";
-import type { ConflictFile, SyncReport, SyncStep } from "../types";
+import type {
+  ConflictFile,
+  ConflictReason,
+  SyncReport,
+  SyncStep,
+} from "../types";
 
 /**
  * Runs the one safe sync sequence. Knows the order; SafeGit knows the safety.
@@ -3147,7 +3145,7 @@ function message(err: unknown): string {
   return String(err);
 }
 
-function describeConflict(reason: string, count: number): string {
+function describeConflict(reason: ConflictReason, count: number): string {
   if (reason === "unrelated-histories") {
     return "local and remote share no history — stopped without changing anything";
   }

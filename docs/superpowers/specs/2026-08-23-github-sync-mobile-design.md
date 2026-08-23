@@ -110,7 +110,7 @@ main.ts                  lifecycle: load settings, wire UI, own the single GitSe
 │   └── log-modal.ts     on-screen step trace (mobile has no console)
 │
 ├── github/api.ts        minimal REST via requestUrl: verify token, repo exists/empty
-├── types.ts             Settings, SyncStatus, SyncReport, ConflictInfo
+├── types.ts             PluginSettings, SyncReport, SyncStep, ConflictFile, MergeOutcome
 └── constants.ts         default branch "main", default excludes, commit author
 ```
 

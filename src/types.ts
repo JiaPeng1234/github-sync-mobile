@@ -13,13 +13,6 @@ export interface PluginSettings {
   commitMessageTemplate: string;
 }
 
-export type SyncStatus =
-  | "idle"
-  | "syncing"
-  | "conflict"
-  | "error"
-  | "not-connected";
-
 /** A file that differs on both sides and needs a user decision. */
 export interface ConflictFile {
   path: string;
