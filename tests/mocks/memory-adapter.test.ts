@@ -63,11 +63,91 @@ describe("MemoryAdapter", () => {
     expect(a.paths()).toEqual([]);
   });
 
-  it("writes into a folder created by mkdir, including intermediates", async () => {
+  it("recovers a git loose-object write via mkdir-and-retry on the error code", async () => {
     const a = new MemoryAdapter();
-    await a.mkdir("a/b");
-    await a.write("a/b/f.md", "deep");
-    expect(await a.read("a/b/f.md")).toBe("deep");
-    expect((await a.stat("a"))?.type).toBe("folder");
+    const objectPath = ".git/objects/ab/cdef0123456789abcdef0123456789abcdef01";
+
+    // The sequence isomorphic-git performs: write, and on a coded failure create the
+    // parent folder and try once more. Deep loose-object paths are what git actually
+    // writes, so this is the shape that matters.
+    let recovered = false;
+    try {
+      await a.write(objectPath, "loose object");
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe("ENOENT");
+      await a.mkdir(".git/objects/ab");
+      await a.write(objectPath, "loose object");
+      recovered = true;
+    }
+
+    expect(recovered).toBe(true);
+    expect(await a.read(objectPath)).toBe("loose object");
+    expect(a.paths()).toEqual([objectPath]);
+    // mkdir created every intermediate level, not just the leaf.
+    expect((await a.stat(".git"))?.type).toBe("folder");
+    expect((await a.stat(".git/objects"))?.type).toBe("folder");
+    expect((await a.stat(".git/objects/ab"))?.type).toBe("folder");
+  });
+
+  it("throws ENOENT from list for a path that does not exist", async () => {
+    const a = new MemoryAdapter();
+    await expect(a.list("nope")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("throws ENOTDIR from list for a path that is a file", async () => {
+    const a = new MemoryAdapter();
+    await a.write("f.md", "x");
+    await expect(a.list("f.md")).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  it("distinguishes an existing empty folder from a missing one", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("empty");
+    // This is the distinction isomorphic-git's readdir turns into null-vs-[]. If both
+    // cases returned empty arrays, a tree walk would read a vanished subtree as
+    // "no entries here" rather than "not there at all".
+    await expect(a.list("empty")).resolves.toEqual({ files: [], folders: [] });
+    await expect(a.list("gone")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("lists the vault root even when it is empty", async () => {
+    const a = new MemoryAdapter();
+    await expect(a.list("")).resolves.toEqual({ files: [], folders: [] });
+  });
+
+  it("honours explicit ctime/mtime from DataWriteOptions", async () => {
+    const a = new MemoryAdapter();
+    await a.write("t.md", "x", { ctime: 111, mtime: 222 });
+    expect(await a.stat("t.md")).toMatchObject({ ctime: 111, mtime: 222 });
+
+    await a.writeBinary("t.bin", new Uint8Array([1]).buffer, { mtime: 333 });
+    expect((await a.stat("t.bin"))!.mtime).toBe(333);
+  });
+
+  it("keeps ctime stable across a rewrite while mtime and size follow the content", async () => {
+    const a = new MemoryAdapter();
+    await a.write("c.md", "one");
+    const first = (await a.stat("c.md"))!;
+    await a.write("c.md", "two-longer");
+    const second = (await a.stat("c.md"))!;
+    expect(second.ctime).toBe(first.ctime);
+    expect(second.mtime).toBeGreaterThan(first.mtime);
+    expect(second.size).toBe(10);
+  });
+
+  it("reports missing files with an ENOENT code, not just a message", async () => {
+    const a = new MemoryAdapter();
+    await expect(a.read("no.md")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(a.readBinary("no.md")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(a.remove("no.md")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("stamps folder times from the clock when mkdir creates them", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("dir");
+    const st = (await a.stat("dir"))!;
+    expect(st.type).toBe("folder");
+    expect(st.mtime).toBe(st.ctime);
+    expect(st.mtime).toBeGreaterThan(1000);
   });
 });

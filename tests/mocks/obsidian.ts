@@ -13,15 +13,25 @@ export interface RequestUrlResponse {
   text: string;
 }
 
-/** Tests overwrite this via setRequestUrlHandler(). */
-let handler: (p: RequestUrlParam) => Promise<RequestUrlResponse> = async () => {
+type RequestUrlHandler = (p: RequestUrlParam) => Promise<RequestUrlResponse>;
+
+const noHandler: RequestUrlHandler = async () => {
   throw new Error("requestUrl called but no handler installed in test");
 };
 
-export function setRequestUrlHandler(
-  h: (p: RequestUrlParam) => Promise<RequestUrlResponse>,
-): void {
+/** Tests overwrite this via setRequestUrlHandler(). */
+let handler: RequestUrlHandler = noHandler;
+
+export function setRequestUrlHandler(h: RequestUrlHandler): void {
   handler = h;
+}
+
+/**
+ * Restores the throwing default. `handler` is module-global, so a handler installed by
+ * one test would otherwise leak into every later test sharing this module registry.
+ */
+export function resetRequestUrlHandler(): void {
+  handler = noHandler;
 }
 
 export function requestUrl(p: RequestUrlParam): Promise<RequestUrlResponse> {
