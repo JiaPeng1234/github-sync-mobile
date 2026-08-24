@@ -48,7 +48,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 2 Test harness | ✅ implemented, spec review passed, quality review approved |
 | 3 Types and constants | ✅ implemented, spec review passed, quality review approved after 4 rounds |
 | 4 Exclude engine | ✅ implemented, both reviews passed |
-| 5 Filesystem bridge | ✅ implemented, spec review passed |
+| 5 Filesystem bridge | ✅ implemented, spec review passed — **code-quality review still owed** |
 | 6 HTTP client | ⬜ plan revised — the two `requestUrl` rules |
 | 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
 | 8 SafeGit: commit | ⬜ |
@@ -101,7 +101,31 @@ would not have been found by inspection. Also tell reviewers to weigh findings b
 actually be lost, and to say plainly when what remains is polish; otherwise rounds do not converge.
 
 **Fix the plan, not just the code.** Several review rounds found defects in code that did not exist
-yet. Correcting the plan is cheap; rediscovering the same defect after the task ships is not.
+yet. Correcting the plan is cheap; rediscovering the same defect after the task ships is not. When a
+task's code changes during review, **sync the plan section from the real files** rather than editing
+it by hand — hand re-transcription reintroduced a literal NUL byte into an already-fixed code block.
+
+**Mutation-test the guards.** This has found more real defects than any other single technique. Copy
+`src/`, `tests/`, and the configs to a temp dir with `node_modules` symlinked, break one guard, and
+run that task's tests. If they still pass, the guard is decorative. Two examples from Task 4/5, both
+of which passed a fully green suite: replacing the wildcard placeholder with a printable character,
+and deleting the exact-size `ArrayBuffer` copy. Every safety-relevant line should have a mutant that
+kills it.
+
+**Ask the implementer two or three probing questions beyond the spec.** Not "did you do it" but
+"what surprising input did you find", "can this be made to hang", "does real isomorphic-git actually
+work through this". Nearly every serious finding started as an answer to one of these. Insist on
+measured answers rather than reasoned ones.
+
+**A test that reaches the code by a convenient route proves nothing about the real route.** Two
+instances so far: a test called `fs.stat(".")` when the library actually sends `"/."`, and a test
+used a helper that failed `stat` when the guard under test was on `list`. Both passed while the code
+was broken. Ask how the production caller actually gets there.
+
+**When a dependency swallows errors, your error code is a decoration.** isomorphic-git's `readdir`
+reports any failure as an empty directory, and its `read` returns `null` on any failure. Throwing the
+right code changes nothing downstream. Always ask what the library *does* with a failure, not what
+you threw. This has bitten three times.
 
 **Disclose your own commits** when dispatching a reviewer, or it will reasonably flag them as scope
 creep.
@@ -215,21 +239,34 @@ Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-an
 
 ## 6. What to do next
 
-Task 5, the filesystem bridge. It adapts Obsidian's `DataAdapter` to the `fs.promises` shape
-isomorphic-git expects, and it is where several load-bearing constraints land at once.
+**First, finish Task 5.** Its implementation and spec review are done, but it never had a
+code-quality review. Everything else has had both. Dispatch that before starting Task 6, or the
+project's most delicate module ships with half the scrutiny the rest got.
+
+What that review should look at: the bridge is now the seam every later data-loss proof runs
+through, and it has accumulated four rounds of fixes (root mapping, read-failure recording,
+backslash handling, exact-size copies). Worth asking whether it is still coherent as a design rather
+than a pile of patches, whether the comments have become a changelog that will rot, and whether the
+`readFailures` contract is the right shape for Task 7 to consume.
+
+**Then Task 6, the HTTP client.** Small and self-contained.
 
 ```
-Plan section: "## Task 5: Filesystem adapter"
-Creates:      src/git/fs-adapter.ts
-Tests:        tests/git/fs-adapter.test.ts
+Plan section: "## Task 6: HTTP client"
+Creates:      src/git/http-client.ts
+Tests:        tests/git/http-client.test.ts
 ```
 
-Read the constraint list at the top of that plan section before writing anything. In particular:
-`rel()` must map both the vault base and git's `"."` to `""`; `readFile` must handle the encoding
-argument in both its object and bare-string forms; never return a native `Buffer`; hand
-`writeBinary` an exact-size `ArrayBuffer`; do not silently create parent directories on write; keep
-`ENOENT`, `ENOTDIR`, and `EISDIR` distinct; and expose the `readFailures` channel, because
-isomorphic-git reports a failed directory read as an empty directory and something has to notice.
+Two rules are already settled and stated in that plan section — do not re-derive them. Always
+`await` the call and then read properties off the result (the awaitable-property form
+`requestUrl(p).json` is not modelled by the test stub and reads as `undefined` under test), and
+always pass `throw: false` and inspect the status yourself rather than keying on `err.status`, which
+the real typings do not promise.
+
+**Then Tasks 7 → 8 → 9 → 10 → 11 in order.** These are the safety core and the hardest work in the
+plan. Task 7 carries two obligations inherited from Task 5, both already written into its plan
+section: treat a *thrown* `statusMatrix` as a refusal, not only a recorded failure; and confirm every
+claimed deletion against the working tree before staging it.
 
 ### Deferred by decision, not oversight
 
