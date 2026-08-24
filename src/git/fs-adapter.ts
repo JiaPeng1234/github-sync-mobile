@@ -175,18 +175,35 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
 
     async readdir(path: string): Promise<string[]> {
       const p = rel(path);
-      const st = await adapter.stat(p);
-      // isomorphic-git converts ENOENT/ENOTDIR from readdir into `null`, which is
-      // how it tells "absent or not a directory" apart from "an empty directory".
-      // Collapsing the two would make a tree walk read an absent subtree as empty,
-      // i.e. as deleted. Keep the codes distinct.
+
+      // EVERY failure in this method has to be recorded, not just thrown.
+      //
+      // isomorphic-git's own `readdir` maps `ENOTDIR` to `null` and swallows
+      // everything else — `ENOENT` included — as `[]`, an empty directory. So a read
+      // that fails here is indistinguishable from an empty folder by the time the
+      // walker sees it, and every file beneath is reported as deleted. Throwing the
+      // right code is necessary but not sufficient: nothing downstream can see it,
+      // which is why `readFailures` exists.
+      //
+      // Both the stat and the listing are wrapped. An earlier version guarded only
+      // the listing, leaving a transient stat failure to be swallowed as `[]` with
+      // nothing recorded — silent, which is the one outcome this project never accepts.
+      let st: Awaited<ReturnType<VaultAdapter["stat"]>>;
+      try {
+        st = await adapter.stat(p);
+      } catch (err) {
+        readFailures.push(p);
+        throw err;
+      }
+
       if (p !== "") {
+        // Genuine absence is not a read failure, so it is not recorded — but the codes
+        // are still kept distinct, because they matter to isomorphic-git's own
+        // write-retry path.
         if (!st) throw enoent(path);
         if (st.type !== "folder") throw enotdir(path);
       }
-      // A failure here is invisible to isomorphic-git, which will read it as an empty
-      // directory and conclude everything beneath was deleted. Record it so SafeGit can
-      // refuse, then rethrow.
+
       let listing: { files: string[]; folders: string[] };
       try {
         listing = await adapter.list(p);

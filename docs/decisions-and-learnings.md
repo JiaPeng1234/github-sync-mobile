@@ -378,6 +378,46 @@ settings tab reports the vault-relative count — "N of M files in this vault ar
 the only place the real answer exists. That readout also happens to surface a typo'd pattern that
 matches nothing, and a case-mismatched one such as `.Obsidian/`.
 
+### A guard placed one line too early only worked on desktop
+
+`rel()` has to map git's repo root to the vault root, and it did — by testing `p === "."`. But
+isomorphic-git's tree walker builds its paths by string concatenation, `` `${dir}/${entry}` ``, not
+with its own `join()`. With the mobile base of `""` the root therefore arrives as **`"/."`**, which
+fell straight through the `"."` test, had its slash stripped afterwards, and came back out as a
+literal `"."` path. `adapter.stat(".")` returned null, and `statusMatrix` threw — so status,
+clone-safe checkout, and merge were all unreachable.
+
+Two things make this worth recording. First, the check existed *because* review had already
+identified this exact hazard; it was simply ordered wrong, before the separator strip rather than
+after. Second, and worse: **it broke only for `base === ""`, which is the mobile target.** With a
+desktop base of `/vault` the path is `/vault/.`, the base-prefix branch strips it, and everything
+works. A desktop-only test suite would have shipped this.
+
+It also passed the plan's own tests, because those called `fs.stat(".")` — a shape the library never
+actually sends. A test that exercises a convenient path shape rather than the real one proves
+nothing about the real one.
+
+### Throwing the right error code is necessary but not sufficient
+
+The read-failure channel exists because isomorphic-git swallows most `readdir` errors as an empty
+directory. Implementing it surfaced two refinements, both found by running real git rather than
+reasoning about it:
+
+- **Not every failure gets swallowed.** The tree walker calls `lstat` before `readdir`, so a failing
+  stat propagates out of `statusMatrix` with nothing recorded at all. That is the safe direction —
+  loud beats silent — but it means the channel alone is not the guard. `SafeGit` has to treat a
+  thrown scan as a refusal too, and now does.
+- **The channel had a silent hole of its own.** The bridge's `readdir` calls `stat` internally, and
+  only the listing call was wrapped. A transient failure in that stat would be swallowed to `[]` with
+  nothing recorded — exactly the outcome the channel was built to prevent. Both calls are wrapped now.
+
+### Non-force checkout is not a repair
+
+Measured: a non-force `checkout` to a ref that is already checked out is a no-op. It does not restore
+a file deleted from the working tree, and it does not revert a locally modified one. That is the safe
+direction, and it is precisely what "never forces" buys — but it means nothing downstream may treat
+checkout as a way to fix a dirty tree.
+
 ### Two deliberate gaps against .gitignore
 
 `?` is a literal, not a single-character wildcard, and bracket classes are literal too — so

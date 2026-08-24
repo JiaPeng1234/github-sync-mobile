@@ -32,7 +32,7 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**4 of 19 tasks implemented.** Nothing that syncs anything exists yet — no git code, no UI. What
+**5 of 19 tasks implemented.** Nothing that syncs anything exists yet — no git code, no UI. What
 exists is the toolchain, the test harness, and the shared vocabulary.
 
 ```
@@ -48,7 +48,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 2 Test harness | ✅ implemented, spec review passed, quality review approved |
 | 3 Types and constants | ✅ implemented, spec review passed, quality review approved after 4 rounds |
 | 4 Exclude engine | ✅ implemented, both reviews passed |
-| 5 Filesystem bridge | ⬜ plan revised — ENOENT/ENOTDIR/EISDIR, `VaultAdapter` type |
+| 5 Filesystem bridge | ✅ implemented, reviews pending |
 | 6 HTTP client | ⬜ plan revised — the two `requestUrl` rules |
 | 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
 | 8 SafeGit: commit | ⬜ |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 61 passed
+npx vitest run       # expect 83 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.

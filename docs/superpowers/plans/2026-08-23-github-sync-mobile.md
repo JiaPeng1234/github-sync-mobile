@@ -1334,18 +1334,35 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
 
     async readdir(path: string): Promise<string[]> {
       const p = rel(path);
-      const st = await adapter.stat(p);
-      // isomorphic-git converts ENOENT/ENOTDIR from readdir into `null`, which is
-      // how it tells "absent or not a directory" apart from "an empty directory".
-      // Collapsing the two would make a tree walk read an absent subtree as empty,
-      // i.e. as deleted. Keep the codes distinct.
+
+      // EVERY failure in this method has to be recorded, not just thrown.
+      //
+      // isomorphic-git's own `readdir` maps `ENOTDIR` to `null` and swallows
+      // everything else — `ENOENT` included — as `[]`, an empty directory. So a read
+      // that fails here is indistinguishable from an empty folder by the time the
+      // walker sees it, and every file beneath is reported as deleted. Throwing the
+      // right code is necessary but not sufficient: nothing downstream can see it,
+      // which is why `readFailures` exists.
+      //
+      // Both the stat and the listing are wrapped. An earlier version guarded only
+      // the listing, leaving a transient stat failure to be swallowed as `[]` with
+      // nothing recorded — silent, which is the one outcome this project never accepts.
+      let st: Awaited<ReturnType<VaultAdapter["stat"]>>;
+      try {
+        st = await adapter.stat(p);
+      } catch (err) {
+        readFailures.push(p);
+        throw err;
+      }
+
       if (p !== "") {
+        // Genuine absence is not a read failure, so it is not recorded — but the codes
+        // are still kept distinct, because they matter to isomorphic-git's own
+        // write-retry path.
         if (!st) throw enoent(path);
         if (st.type !== "folder") throw enotdir(path);
       }
-      // A failure here is invisible to isomorphic-git, which will read it as an empty
-      // directory and conclude everything beneath was deleted. Record it so SafeGit can
-      // refuse, then rethrow.
+
       let listing: { files: string[]; folders: string[] };
       try {
         listing = await adapter.list(p);
@@ -1406,7 +1423,8 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/fs-adapter.test.ts`
-Expected: PASS, 19 tests.
+Expected: PASS, 22 tests. The three read-failure cases are the ones that matter: a swallowed
+failure is what makes an intact folder look deleted.
 
 - [ ] **Step 5: Commit**
 
@@ -2051,10 +2069,26 @@ export class SafeGit {
    */
   private async scanWorkingTree(): Promise<Array<[string, number, number, number]>> {
     this.fsChannel.clearReadFailures();
-    const matrix = (await git.statusMatrix({
-      ...this.base(),
-      filter: (f) => !this.exclude.isExcluded(f),
-    })) as Array<[string, number, number, number]>;
+
+    // A throw is also a refusal.
+    //
+    // The read-failure channel catches failures isomorphic-git swallows, but not every
+    // failure gets swallowed: the tree walker calls `lstat` before `readdir`, so a
+    // failing stat propagates out of `statusMatrix` with nothing recorded. That is the
+    // safe direction — loud rather than silent — but it means the channel alone is not
+    // the whole guard. Both paths have to end in "do not trust this scan".
+    let matrix: Array<[string, number, number, number]>;
+    try {
+      matrix = (await git.statusMatrix({
+        ...this.base(),
+        filter: (f) => !this.exclude.isExcluded(f),
+      })) as Array<[string, number, number, number]>;
+    } catch (err) {
+      throw new Error(
+        `Could not scan the vault: ${message(err)}. Refusing to continue, because a ` +
+          `partial scan would look like deleted files. Nothing was changed — try again.`,
+      );
+    }
 
     const failed = this.fsChannel.readFailures;
     if (failed.length > 0) {
@@ -2727,7 +2761,14 @@ Add these methods inside the `SafeGit` class:
     return oid;
   }
 
-  /** Checks out the non-excluded files of a commit. Never forces. */
+  /**
+   * Checks out the non-excluded files of a commit. Never forces.
+   *
+   * Measured caveat: a non-force checkout to a ref that is already checked out is a
+   * no-op. It does not restore a file deleted from the working tree, and it does not
+   * revert a locally modified one. That is the safe direction — it cannot clobber — but
+   * it means this is not a repair mechanism, and no caller should treat it as one.
+   */
   private async checkoutTracked(oid: string): Promise<void> {
     const tracked = await git.listFiles({ ...this.base(), ref: oid });
     const wanted = this.exclude.withoutExcluded(tracked);

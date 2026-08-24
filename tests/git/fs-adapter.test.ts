@@ -4,8 +4,10 @@ import { MemoryAdapter } from "../mocks/memory-adapter";
 
 function setup(base = "") {
   const adapter = new MemoryAdapter();
-  const fs = createFs(adapter, base);
-  return { adapter, fs: fs.promises };
+  const bridge = createFs(adapter, base);
+  // `bridge` is exposed as well as `bridge.promises` because the read-failure channel
+  // lives beside `promises`, not inside it — isomorphic-git only ever touches the latter.
+  return { adapter, fs: bridge.promises, bridge };
 }
 
 describe("fs-adapter", () => {
@@ -152,5 +154,39 @@ describe("fs-adapter", () => {
     const { fs } = setup();
     await fs.writeFile("a.md", "x");
     expect((await fs.lstat("a.md")).isSymbolicLink()).toBe(false);
+  });
+
+  /**
+   * Both failure points inside readdir must be recorded, not just thrown.
+   *
+   * isomorphic-git swallows any readdir failure other than ENOTDIR as an empty
+   * directory, so the throw alone is invisible and every file beneath the folder
+   * gets reported as deleted. An earlier version guarded only the listing call,
+   * leaving a transient stat failure silent.
+   */
+  it("records a failed directory listing so it cannot pass as an empty directory", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.mkdir("notes");
+    await adapter.write("notes/a.md", "x");
+    adapter.failReadsAt("notes", "EIO");
+
+    await expect(fs.readdir("notes")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("notes");
+  });
+
+  it("does not record genuine absence as a read failure", async () => {
+    const { fs, bridge } = setup();
+    await expect(fs.readdir("nope")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(bridge.readFailures).toEqual([]);
+  });
+
+  it("clears recorded read failures on request", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.mkdir("notes");
+    adapter.failReadsAt("notes", "EIO");
+    await expect(fs.readdir("notes")).rejects.toBeTruthy();
+    expect(bridge.readFailures.length).toBe(1);
+    bridge.clearReadFailures();
+    expect(bridge.readFailures).toEqual([]);
   });
 });
