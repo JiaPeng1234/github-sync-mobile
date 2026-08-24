@@ -332,6 +332,52 @@ matched, which is what .gitignore does for a pattern naming a directory.
 The same rework made `**/` match zero directories as well as many, so `**/*.png` now covers a
 root-level `a.png` — what a user writing that pattern means.
 
+### An untested trap is the defect
+
+The exclude module's comments are essentially a list of traps: the non-printable placeholder, the
+escape class, the collapse order, the universal subtree suffix. Mutation testing found that
+**fourteen edits to the compiler left the whole suite green** — including the two the comments
+spend the most words on. Replacing the placeholder with a space passed. Removing `.` from the
+escape class passed, which would make `*.png` exclude `abcpng`. Removing duplicate-slash
+collapsing passed, which reopens the token leak, because `.obsidian//` then compiles to something
+that does not match `.obsidian/app.json` at all — and a doubled slash is easy to paste.
+
+The lesson is not "add more tests". It is that **a comment explaining why something is load-bearing
+is a promise the test suite has to keep.** Nine mutations are now pinned explicitly, each verified
+to fail without its guard.
+
+That protection then paid for a simplification. The multi-step pipeline needed placeholder
+sentinels purely to stop the `*` rule eating the asterisks inside `**`, and a single ordered
+`String.replace` with an alternation needs none:
+
+```js
+p.replace(/\*\*\/|\*\*|\*|[.+^${}()|[\]\\?]/g, translate)
+```
+
+Longest wildcard first, everything else escaped, one pass. That deletes both sentinels, the comment
+explaining why they must not be printable, and the possibility of escaping before translating. The
+refactor was verified behaviour-identical over five million pattern/path comparisons — but it was
+only safe to make *because* the traps had tests by then.
+
+### `matchesEverything` can only see universality
+
+Guarding against "this pattern excludes everything" turned out to have two levels, and the cheap
+one is not the one that bites.
+
+A vault-independent probe catches `*`, `**`, `***`, `*/` — genuinely universal patterns. It cannot
+catch a pattern that excludes *this user's* entire vault while sparing something hypothetical:
+`**` followed by `/*.md` excludes every file in a Markdown-only vault, which is the common Obsidian
+case, and is not flagged because it spares a `.png`. Same harm, invisible.
+
+Review also found the first probe set produced false positives: all five paths happened to contain
+`a` and `.`, so `**a*` tripped it while sparing real files — and the warning text would have been
+factually wrong. The probes now deliberately share no character.
+
+So there are two checks, at two layers. `matchesEverything` stays as the abstract tripwire, and the
+settings tab reports the vault-relative count — "N of M files in this vault are excluded" — which is
+the only place the real answer exists. That readout also happens to surface a typo'd pattern that
+matches nothing, and a case-mismatched one such as `.Obsidian/`.
+
 ### Two deliberate gaps against .gitignore
 
 `?` is a literal, not a single-character wildcard, and bracket classes are literal too — so

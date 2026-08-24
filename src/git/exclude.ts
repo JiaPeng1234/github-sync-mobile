@@ -1,7 +1,14 @@
 export interface ExcludeMatcher {
   isExcluded(path: string): boolean;
-  /** Keeps only non-excluded paths, preserving order. */
-  filter(paths: string[]): string[];
+  /**
+   * Keeps only the non-excluded paths, preserving order.
+   *
+   * Named for what it returns rather than what it removes: read as `filter`, a call
+   * site could plausibly be understood as keeping the excluded ones, and inverted at
+   * clone-checkout that would write the remote's `.obsidian` over this device's config
+   * and skip every note.
+   */
+  withoutExcluded(paths: string[]): string[];
 }
 
 /** Vault-relative, forward slashes, no leading ./ or /. */
@@ -12,95 +19,82 @@ function normalise(p: string): string {
   return out.replace(/\/{2,}/g, "/");
 }
 
-/**
- * Sentinels standing in for `**\/` and `**` while `*` is being translated, so the
- * three do not interfere.
- *
- * NUL and SOH are safe because neither can appear in a vault path — a printable
- * placeholder such as a space could, and would then be rewritten into `.*`,
- * silently over-matching every path containing that character. In an exclude
- * engine over-matching means files are never pushed, which is a silent backup
- * loss. Written as escapes so this file stays textual to `grep` and survives
- * copy-paste.
- */
-const DOUBLE_STAR_SLASH = "\u0000";
-const DOUBLE_STAR = "\u0001";
-
 function toRegExp(rawPattern: string): RegExp {
   let p = normalise(rawPattern);
 
-  // `dir/`, `dir/*` and `dir/**` all mean "dir and everything under it". Users of
-  // the prior plugin wrote `dir/*` expecting recursion, so honour that intent
-  // rather than silently under-matching. The trailing-directory match is applied
-  // to every pattern below, so all three collapse to the bare name here.
+  // `dir/`, `dir/*` and `dir/**` all mean "dir and everything under it". Users of the
+  // prior plugin wrote `dir/*` expecting recursion, so honour that intent rather than
+  // silently under-matching. All three collapse to the bare name, because the
+  // trailing-subtree match below applies to every pattern.
+  //
+  // Not redundant: stripping them is what makes `isExcluded(".obsidian")` true for
+  // every spelling, which is how a caller prunes a whole subtree instead of walking
+  // into it.
   if (p.endsWith("/**")) p = p.slice(0, -3);
   else if (p.endsWith("/*")) p = p.slice(0, -2);
   else if (p.endsWith("/")) p = p.slice(0, -1);
 
-  // Collapse redundant asterisk runs before translating them.
+  // Collapse asterisk runs before translating them. Adjacent `.*` groups backtrack
+  // exponentially in the length of the path being tested, and there is no timeout
+  // anywhere in the sync path — so a pasted `****` is a wedged app, not a stutter.
+  // Neither rewrite can ever broaden a pattern, and the star-run rewrite additionally
+  // repairs a pre-existing over-match in `*{3,}/` shapes.
   //
-  // Both collapses exist to stop the compiled regex backtracking exponentially in the
-  // length of the path being tested. There is no timeout anywhere in the sync path, so
-  // a slow pattern is not a stutter — it is a wedged app on a device where the user
-  // can inspect nothing.
-  //
-  // Measured before these collapses, one `isExcluded` call:
-  //   `**/` x12 against a depth-30 path      10.3 s
-  //   `*` x13 + ".png" against an ordinary
-  //   84-character vault path                27.1 s
-  //   `*` x18 + "z.md"                       did not return in four minutes
-  //
-  // The `*` case is the one that matters in practice. `**/` x12 is not something a
-  // person types; a held-down asterisk key, or a pasted `****************` separator,
-  // is. `*` is also the wildcard users reach for, because the predecessor plugin
-  // supported only `*`.
-  //
-  // Both rewrites are semantically free. Three or more asterisks in a row are exactly
-  // `**`, because `.*` already subsumes the `[^/]*` that an odd trailing star would
-  // add; and consecutive "any number of directories" groups say nothing more than one
-  // of them does.
+  // Measurements, and why the plain-`*` case is the one that actually reaches a
+  // settings box, are in docs/decisions-and-learnings.md under "A user-editable regex
+  // is an attack surface on your own phone".
   p = p.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
 
-  const body = p
-    .replace(/[.+^${}()|[\]\\?]/g, "\\$&")
-    .replace(/\*\*\//g, DOUBLE_STAR_SLASH)
-    .replace(/\*\*/g, DOUBLE_STAR)
-    .replace(/\*/g, "[^/]*")
-    .split(DOUBLE_STAR_SLASH)
-    .join("(?:.*/)?")
-    .split(DOUBLE_STAR)
-    .join(".*");
+  // One ordered pass: longest wildcard first, everything else escaped.
+  //
+  // Single-pass is deliberate. A multi-step pipeline needs a placeholder to stop the
+  // `*` rule eating the asterisks inside `**`, and a printable placeholder would itself
+  // be rewritten — so `My Notes` would compile to `^My.*Notes$` and match
+  // `My/Notes/a.md`. Over-matching an exclude means the file is never pushed, which is
+  // silent backup loss. Here there is no placeholder to get wrong, and escaping cannot
+  // accidentally run before translation.
+  const body = p.replace(/\*\*\/|\*\*|\*|[.+^${}()|[\]\\?]/g, (token) => {
+    if (token === "**/") return "(?:.*/)?";
+    if (token === "**") return ".*";
+    if (token === "*") return "[^/]*";
+    return `\\${token}`;
+  });
 
   // Every pattern also matches everything beneath whatever it matched.
   //
-  // This is what makes a bare `.obsidian` behave like `.obsidian/`. Without it, a
-  // user who edits the exclude list and drops the trailing slash still excludes the
-  // directory entry but silently syncs its contents — which for `.obsidian` means
-  // publishing the plugin's own settings file, and with it the GitHub token. It also
-  // matches how .gitignore treats a pattern that names a directory.
+  // This is what makes a bare `.obsidian` behave like `.obsidian/`. Without it, a user
+  // who drops the trailing slash still excludes the directory entry but silently syncs
+  // its contents — which for `.obsidian` means publishing the plugin's settings file,
+  // and with it the GitHub token. Same rule .gitignore uses for a pattern naming a
+  // directory.
   return new RegExp(`^${body}(?:/.*)?$`);
 }
 
 /**
- * True when a single pattern would exclude the whole vault.
+ * True when a single pattern would exclude every file in any vault.
  *
- * `*` excludes everything, because it matches a directory segment and every pattern
- * also matches what lies beneath whatever it matched. That is the same rule .gitignore
- * uses, and it is what makes a bare `.obsidian` protect the token file — but it means
- * one stray character in the exclude box silences the entire sync: nothing is staged,
- * nothing is pushed, and the sync still reports success over an empty change set.
- * Silent backup loss, on the platform where the user can inspect nothing.
+ * Decided by probing rather than by inspecting the pattern, so no arrangement of
+ * asterisks slips past a structural check.
  *
- * Decided empirically rather than by inspecting the pattern, so no amount of creative
- * asterisk arrangement can slip past a structural check.
+ * Detects *universality* only, and that limit is real: a pattern covering every
+ * extension a given vault happens to use — `**` followed by `/*.md` in a Markdown-only
+ * vault, the common Obsidian case — excludes everything the user has while sparing a
+ * hypothetical `.png`, so it is not flagged here. The vault-relative question ("how many
+ * of this user's files would this exclude?") can only be answered where the file list
+ * is, so the settings tab reports that separately. Both matter, because silencing the
+ * sync yields a successful-looking sync over an empty change set.
  */
 export function matchesEverything(pattern: string): boolean {
+  // Deliberately share no character in common. An earlier probe set all contained "a"
+  // and ".", so patterns like `**a*` tripped it while sparing real files.
   const probes = [
     "a.md",
     "sub/a.md",
-    "sub/deep/a.md",
+    "sub/deep/a.png",
     ".obsidian/app.json",
-    "Attachments/img.png",
+    "z",
+    "Q3/log.txt",
+    "no-extension",
   ];
   const m = compileExcludes([pattern]);
   return probes.every((probe) => m.isExcluded(probe));
@@ -120,6 +114,6 @@ export function compileExcludes(patterns: readonly string[]): ExcludeMatcher {
 
   return {
     isExcluded,
-    filter: (paths) => paths.filter((p) => !isExcluded(p)),
+    withoutExcluded: (paths) => paths.filter((p) => !isExcluded(p)),
   };
 }

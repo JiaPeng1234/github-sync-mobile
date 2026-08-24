@@ -47,7 +47,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 1 Project scaffolding | ✅ implemented, spec review passed, quality review approved |
 | 2 Test harness | ✅ implemented, spec review passed, quality review approved |
 | 3 Types and constants | ✅ implemented, spec review passed, quality review approved after 4 rounds |
-| 4 Exclude engine | ✅ implemented, spec review passed |
+| 4 Exclude engine | ✅ implemented, both reviews passed |
 | 5 Filesystem bridge | ⬜ plan revised — ENOENT/ENOTDIR/EISDIR, `VaultAdapter` type |
 | 6 HTTP client | ⬜ plan revised — the two `requestUrl` rules |
 | 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
@@ -59,7 +59,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 13 GitHub API client | ⬜ |
 | 14 Log modal | ⬜ |
 | 15 Conflict modal | ⬜ plan revised — binary/unreadable rendering |
-| 16 Settings tab | ⬜ plan revised |
+| 16 Settings tab | ⬜ plan revised — exclude-everything warning + vault coverage readout |
 | 17 Sync panel | ⬜ |
 | 18 Plugin entry point | ⬜ plan revised |
 | 19 Release workflow + README | ⬜ |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 54 passed
+npx vitest run       # expect 61 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
