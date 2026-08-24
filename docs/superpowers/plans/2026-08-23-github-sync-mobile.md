@@ -786,7 +786,7 @@ describe("compileExcludes", () => {
 
   it("filters a list of paths, keeping order", () => {
     const m = compileExcludes([".obsidian/"]);
-    expect(m.filter(["a.md", ".obsidian/app.json", "b.md"])).toEqual(["a.md", "b.md"]);
+    expect(m.withoutExcluded(["a.md", ".obsidian/app.json", "b.md"])).toEqual(["a.md", "b.md"]);
   });
 });
 ```

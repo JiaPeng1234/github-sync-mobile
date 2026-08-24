@@ -190,9 +190,15 @@ describe("compiler invariants", () => {
     expect(compileExcludes(["(a).md"]).isExcluded("a.md")).toBe(false);
     expect(compileExcludes(["f[0-9].md"]).isExcluded("f1.md")).toBe(false);
     expect(compileExcludes(["a^b$c.md"]).isExcluded("abc.md")).toBe(false);
-    // ...while still matching itself.
+    // ...while still matching itself. These positive assertions are the ones that pin
+    // the escaping: an unescaped mid-string `^` or `$` matches *nothing*, so the
+    // negative assertion above stays true even if they are dropped from the class.
     expect(compileExcludes(["a|b.md"]).isExcluded("a|b.md")).toBe(true);
     expect(compileExcludes(["f[0-9].md"]).isExcluded("f[0-9].md")).toBe(true);
+    expect(compileExcludes(["a^b$c.md"]).isExcluded("a^b$c.md")).toBe(true);
+    expect(compileExcludes(["a{2}.md"]).isExcluded("a{2}.md")).toBe(true);
+    expect(compileExcludes(["(a).md"]).isExcluded("(a).md")).toBe(true);
+    expect(compileExcludes(["note?.md"]).isExcluded("note?.md")).toBe(true);
   });
 
   // A doubled slash is easy to paste. Without slash collapsing, `.obsidian//` compiles
@@ -224,7 +230,9 @@ describe("compiler invariants", () => {
   });
 
   it("treats a comment as a comment and an empty path as included", () => {
-    expect(compileExcludes(["# a comment"]).isExcluded("a comment")).toBe(false);
+    // Probe the path the comment would compile to, not a different one: "a comment"
+    // never matched `^#\ a\ comment$` anyway, so it could not detect the filter's loss.
+    expect(compileExcludes(["# a comment"]).isExcluded("# a comment")).toBe(false);
     expect(compileExcludes(["*"]).isExcluded("")).toBe(false);
   });
 });
