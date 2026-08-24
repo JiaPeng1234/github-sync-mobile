@@ -189,4 +189,91 @@ describe("fs-adapter", () => {
     bridge.clearReadFailures();
     expect(bridge.readFailures).toEqual([]);
   });
+
+  /**
+   * The hole that let `commit` produce an empty tree.
+   *
+   * isomorphic-git's `read` has a bare `catch { return null }`, so an unreadable
+   * `.git/index` makes every file look deleted and a commit built from that status has an
+   * empty tree — while the working tree is intact. Nothing about the error code helps;
+   * only recording does.
+   */
+  it("records a failed content read", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    adapter.failReadsAt("a.md", "EIO");
+    await expect(fs.readFile("a.md", "utf8")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("a.md");
+  });
+
+  it("records a failed stat", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    adapter.failReadsAt("a.md", "EIO");
+    await expect(fs.stat("a.md")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("a.md");
+  });
+
+  it("does not record a missing file as a read failure", async () => {
+    const { fs, bridge } = setup();
+    await expect(fs.readFile("nope.md", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat("nope.md")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(bridge.readFailures).toEqual([]);
+  });
+
+  /**
+   * Pins the listing guard specifically. `failReadsAt` fails `stat` as well, and `stat`
+   * runs first, so the existing test could not tell the two guards apart — deleting the
+   * listing guard left the whole suite green.
+   */
+  it("records a failed listing even when stat succeeds", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.mkdir("notes");
+    await adapter.write("notes/a.md", "x");
+    const failing = new Error("EIO: injected") as Error & { code: string };
+    failing.code = "EIO";
+    adapter.list = async () => {
+      throw failing;
+    };
+
+    await expect(fs.readdir("notes")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("notes");
+  });
+
+  it("does not hand out the live read-failure array", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    adapter.failReadsAt("a.md", "EIO");
+    await expect(fs.readFile("a.md", "utf8")).rejects.toBeTruthy();
+
+    const snapshot = bridge.readFailures;
+    (snapshot as string[]).push("injected-by-caller");
+    expect(bridge.readFailures).not.toContain("injected-by-caller");
+  });
+
+  /**
+   * Pins the exact-size copy. Node pools small Buffers, so `data.buffer` for a Buffer of
+   * a few bytes is an 8192-byte allocation — handing that to writeBinary writes the whole
+   * pool, and git then dies reading its own loose object back.
+   */
+  it("writes exactly the bytes given, not the whole backing buffer", async () => {
+    const { adapter, fs } = setup();
+    const backing = new Uint8Array([9, 9, 1, 2, 3, 9, 9, 9, 9]);
+    const view = backing.subarray(2, 5);
+    expect(view.byteLength).toBe(3);
+    expect(view.buffer.byteLength).toBe(9);
+
+    await fs.writeFile("v.bin", view);
+    const stored = new Uint8Array(await adapter.readBinary("v.bin"));
+    expect(Array.from(stored)).toEqual([1, 2, 3]);
+  });
+
+  // Backslashes are legal in an iOS/macOS filename, and git never sends them as
+  // separators. Rewriting them made such a note silently unsyncable.
+  it("treats a backslash as an ordinary filename character", async () => {
+    const { adapter, fs } = setup();
+    await adapter.write("a\\b.md", "backslash");
+    expect(await fs.readFile("a\\b.md", "utf8")).toBe("backslash");
+    await expect(fs.readFile("a/b.md", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });

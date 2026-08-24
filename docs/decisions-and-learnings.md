@@ -411,6 +411,54 @@ reasoning about it:
   only the listing call was wrapped. A transient failure in that stat would be swallowed to `[]` with
   nothing recorded — exactly the outcome the channel was built to prevent. Both calls are wrapped now.
 
+### An unreadable index made `commit` ship an empty tree
+
+The read-failure channel was built for `readdir`, because isomorphic-git reports a failed
+directory listing as an empty directory. Review found the same hole one function over, with a
+larger blast radius: `FileSystem.read` has a bare `catch { return null }`.
+
+Measured, with only the content read failing and `stat` still succeeding:
+
+- **`.git/index` unreadable** → `statusMatrix` reports every file as `110`, and **`git.commit`
+  succeeds, producing a commit whose tree is empty** — every file deleted — while the working tree
+  is completely intact. Nothing recorded.
+- **`.git/refs/heads/main` unreadable** → the repo looks unborn, history silently gone.
+
+Pushing either result deletes the user's vault from the remote, from a transient read failure, with
+a sync that reports success.
+
+Every read path — `readFile`, `stat`, and both calls inside `readdir` — now goes through one
+recorder. Recording is free of false positives here, which is what makes it safe to be
+indiscriminate: the adapter signals genuine absence by returning `null` from `stat`, never by
+throwing, so any throw is unambiguously a failure.
+
+The general lesson, now three times over: **when a dependency swallows errors, the error code is
+not a signal — it is a decoration.** Ask what the library does with the failure, not what you threw.
+
+### A test that cannot distinguish two guards pins neither
+
+Deleting the guard around the directory listing left the entire suite green. The test named
+"records a failed directory listing" used the mock's `failReadsAt`, which fails `stat` too — and
+`stat` runs first, so the test only ever exercised the stat guard. Two guards, one covered.
+
+Same shape as the `fs.stat(".")` problem: a test that reaches the code by a convenient route proves
+nothing about the route that actually occurs. The listing guard is now pinned by stubbing
+`adapter.list` alone.
+
+Also unpinned until now, and both verified by mutation: the exact-size `ArrayBuffer` copy (removing
+it leaves the suite green, but Node pools small Buffers, so a real run writes an 8192-byte loose
+object and git dies reading it back), and the root-mapping order itself.
+
+### Backslashes are filenames, not separators
+
+`rel()` rewrote every backslash to a forward slash. Only a Windows `basePath` needs that, and the
+base is normalised separately — but backslashes are legal characters in an iOS or macOS filename.
+
+A vault containing `a\b.md` was therefore unsyncable: `statusMatrix` threw `ENOENT` naming
+`a/b.md`, a path the user does not have. Worse, if a real `a/b.md` also existed the failure went
+silent — the listing reported `a/b.md` twice, `a\b.md` was never staged or committed, and nothing
+was recorded. A note the user believed was backed up never was.
+
 ### Non-force checkout is not a repair
 
 Measured: a non-force `checkout` to a ref that is already checked out is a no-op. It does not restore

@@ -997,8 +997,10 @@ import { MemoryAdapter } from "../mocks/memory-adapter";
 
 function setup(base = "") {
   const adapter = new MemoryAdapter();
-  const fs = createFs(adapter, base);
-  return { adapter, fs: fs.promises };
+  const bridge = createFs(adapter, base);
+  // `bridge` is exposed as well as `bridge.promises` because the read-failure channel
+  // lives beside `promises`, not inside it — isomorphic-git only ever touches the latter.
+  return { adapter, fs: bridge.promises, bridge };
 }
 
 describe("fs-adapter", () => {
@@ -1146,6 +1148,127 @@ describe("fs-adapter", () => {
     await fs.writeFile("a.md", "x");
     expect((await fs.lstat("a.md")).isSymbolicLink()).toBe(false);
   });
+
+  /**
+   * Both failure points inside readdir must be recorded, not just thrown.
+   *
+   * isomorphic-git swallows any readdir failure other than ENOTDIR as an empty
+   * directory, so the throw alone is invisible and every file beneath the folder
+   * gets reported as deleted. An earlier version guarded only the listing call,
+   * leaving a transient stat failure silent.
+   */
+  it("records a failed directory listing so it cannot pass as an empty directory", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.mkdir("notes");
+    await adapter.write("notes/a.md", "x");
+    adapter.failReadsAt("notes", "EIO");
+
+    await expect(fs.readdir("notes")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("notes");
+  });
+
+  it("does not record genuine absence as a read failure", async () => {
+    const { fs, bridge } = setup();
+    await expect(fs.readdir("nope")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(bridge.readFailures).toEqual([]);
+  });
+
+  it("clears recorded read failures on request", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.mkdir("notes");
+    adapter.failReadsAt("notes", "EIO");
+    await expect(fs.readdir("notes")).rejects.toBeTruthy();
+    expect(bridge.readFailures.length).toBe(1);
+    bridge.clearReadFailures();
+    expect(bridge.readFailures).toEqual([]);
+  });
+
+  /**
+   * The hole that let `commit` produce an empty tree.
+   *
+   * isomorphic-git's `read` has a bare `catch { return null }`, so an unreadable
+   * `.git/index` makes every file look deleted and a commit built from that status has an
+   * empty tree — while the working tree is intact. Nothing about the error code helps;
+   * only recording does.
+   */
+  it("records a failed content read", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    adapter.failReadsAt("a.md", "EIO");
+    await expect(fs.readFile("a.md", "utf8")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("a.md");
+  });
+
+  it("records a failed stat", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    adapter.failReadsAt("a.md", "EIO");
+    await expect(fs.stat("a.md")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("a.md");
+  });
+
+  it("does not record a missing file as a read failure", async () => {
+    const { fs, bridge } = setup();
+    await expect(fs.readFile("nope.md", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat("nope.md")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(bridge.readFailures).toEqual([]);
+  });
+
+  /**
+   * Pins the listing guard specifically. `failReadsAt` fails `stat` as well, and `stat`
+   * runs first, so the existing test could not tell the two guards apart — deleting the
+   * listing guard left the whole suite green.
+   */
+  it("records a failed listing even when stat succeeds", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.mkdir("notes");
+    await adapter.write("notes/a.md", "x");
+    const failing = new Error("EIO: injected") as Error & { code: string };
+    failing.code = "EIO";
+    adapter.list = async () => {
+      throw failing;
+    };
+
+    await expect(fs.readdir("notes")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("notes");
+  });
+
+  it("does not hand out the live read-failure array", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    adapter.failReadsAt("a.md", "EIO");
+    await expect(fs.readFile("a.md", "utf8")).rejects.toBeTruthy();
+
+    const snapshot = bridge.readFailures;
+    (snapshot as string[]).push("injected-by-caller");
+    expect(bridge.readFailures).not.toContain("injected-by-caller");
+  });
+
+  /**
+   * Pins the exact-size copy. Node pools small Buffers, so `data.buffer` for a Buffer of
+   * a few bytes is an 8192-byte allocation — handing that to writeBinary writes the whole
+   * pool, and git then dies reading its own loose object back.
+   */
+  it("writes exactly the bytes given, not the whole backing buffer", async () => {
+    const { adapter, fs } = setup();
+    const backing = new Uint8Array([9, 9, 1, 2, 3, 9, 9, 9, 9]);
+    const view = backing.subarray(2, 5);
+    expect(view.byteLength).toBe(3);
+    expect(view.buffer.byteLength).toBe(9);
+
+    await fs.writeFile("v.bin", view);
+    const stored = new Uint8Array(await adapter.readBinary("v.bin"));
+    expect(Array.from(stored)).toEqual([1, 2, 3]);
+  });
+
+  // Backslashes are legal in an iOS/macOS filename, and git never sends them as
+  // separators. Rewriting them made such a note silently unsyncable.
+  it("treats a backslash as an ordinary filename character", async () => {
+    const { adapter, fs } = setup();
+    await adapter.write("a\\b.md", "backslash");
+    expect(await fs.readFile("a\\b.md", "utf8")).toBe("backslash");
+    await expect(fs.readFile("a/b.md", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });
 ```
 
@@ -1271,14 +1394,32 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
   /**
    * Reads that failed for a reason other than the path being absent.
    *
-   * isomorphic-git cannot see these — its `readdir` reports any failure as an empty
-   * directory — so they are surfaced here instead and checked by SafeGit before it trusts
-   * a status. See the note above `readdir`.
+   * isomorphic-git cannot see these. Its `readdir` reports any failure as an empty
+   * directory, and its `read` has a bare `catch { return null }` — so a failed read of
+   * `.git/index` makes every file look deleted and lets `commit` produce a commit whose
+   * tree is empty, while the working tree is intact. Failures are surfaced here instead
+   * and checked by SafeGit before it trusts anything it read.
+   *
+   * Genuine absence is never recorded: the adapter signals that by returning `null` from
+   * `stat`, never by throwing, so any throw is unambiguously a failure.
    */
   const readFailures: string[] = [];
 
+  /** Records a read failure once, then lets it propagate. */
+  const recordRead = <T>(p: string, read: () => Promise<T>): Promise<T> =>
+    read().catch((err: unknown) => {
+      if (!readFailures.includes(p)) readFailures.push(p);
+      throw err;
+    });
+
   const rel = (abs: string): string => {
-    let p = abs.replace(/\\/g, "/");
+    // Deliberately does NOT rewrite backslashes. They are legal characters in an
+    // iOS/macOS filename, and git never sends them as separators — only a Windows
+    // `basePath` needs that, which `normBase` above already handles. Rewriting here made
+    // a vault containing `a\b.md` unsyncable: `statusMatrix` threw ENOENT naming a path
+    // the user does not have, and if a real `a/b.md` also existed the failure was silent,
+    // with `a\b.md` never staged and nothing recorded.
+    let p = abs;
     if (normBase) {
       // The base itself is the vault root, which Obsidian addresses as "".
       if (p === normBase) return "";
@@ -1305,10 +1446,13 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
   const promises = {
     async readFile(path: string, options?: unknown): Promise<string | Uint8Array> {
       const p = rel(path);
-      const st = await adapter.stat(p);
+      // Both the stat and the content read are recorded. isomorphic-git's `read`
+      // swallows any failure as `null`, so an unreadable `.git/index` silently reports
+      // every file as deleted and a commit built from it has an empty tree.
+      const st = await recordRead(p, () => adapter.stat(p));
       if (!st || st.type !== "file") throw enoent(path);
-      if (wantsText(options)) return adapter.read(p);
-      return new Uint8Array(await adapter.readBinary(p));
+      if (wantsText(options)) return recordRead(p, () => adapter.read(p));
+      return new Uint8Array(await recordRead(p, () => adapter.readBinary(p)));
     },
 
     async writeFile(
@@ -1347,13 +1491,7 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
       // Both the stat and the listing are wrapped. An earlier version guarded only
       // the listing, leaving a transient stat failure to be swallowed as `[]` with
       // nothing recorded — silent, which is the one outcome this project never accepts.
-      let st: Awaited<ReturnType<VaultAdapter["stat"]>>;
-      try {
-        st = await adapter.stat(p);
-      } catch (err) {
-        readFailures.push(p);
-        throw err;
-      }
+      const st = await recordRead(p, () => adapter.stat(p));
 
       if (p !== "") {
         // Genuine absence is not a read failure, so it is not recorded — but the codes
@@ -1363,16 +1501,10 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
         if (st.type !== "folder") throw enotdir(path);
       }
 
-      let listing: { files: string[]; folders: string[] };
-      try {
-        listing = await adapter.list(p);
-      } catch (err) {
-        readFailures.push(p);
-        throw err;
-      }
-      const base = p === "" ? "" : `${p}/`;
+      const listing = await recordRead(p, () => adapter.list(p));
+      const prefix = p === "" ? "" : `${p}/`;
       return [...listing.files, ...listing.folders].map((f) =>
-        f.startsWith(base) ? f.slice(base.length) : f,
+        f.startsWith(prefix) ? f.slice(prefix.length) : f,
       );
     },
 
@@ -1390,7 +1522,7 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
     async stat(path: string): Promise<StatsLike> {
       const p = rel(path);
       if (p === "") return makeStats("dir", 0, 0);
-      const st = await adapter.stat(p);
+      const st = await recordRead(p, () => adapter.stat(p));
       if (!st) throw enoent(path);
       return makeStats(st.type === "file" ? "file" : "dir", st.size, st.mtime);
     },
@@ -1410,8 +1542,10 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
 
   return {
     promises,
+    // A copy, not the live array: `readonly` is a type-level claim only, and a caller
+    // that pushed into it would be corrupting the guard SafeGit relies on.
     get readFailures() {
-      return readFailures;
+      return [...readFailures];
     },
     clearReadFailures() {
       readFailures.length = 0;
@@ -1423,8 +1557,9 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/fs-adapter.test.ts`
-Expected: PASS, 22 tests. The three read-failure cases are the ones that matter: a swallowed
-failure is what makes an intact folder look deleted.
+Expected: PASS, 26 tests. The read-failure cases matter most: a swallowed failure is what makes
+an intact folder look deleted, and an unreadable `.git/index` is what lets a commit ship an empty
+tree.
 
 - [ ] **Step 5: Commit**
 
