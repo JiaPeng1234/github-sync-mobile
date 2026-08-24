@@ -2582,12 +2582,23 @@ Add these methods inside the `SafeGit` class:
       map: async (filepath, entries) => {
         if (filepath === ".") return undefined;
         const types = await Promise.all(entries.map((e) => (e ? e.type() : null)));
-        // Let the walk descend into directories; only compare leaves.
-        if (types.some((t) => t === "tree")) return undefined;
-        const [baseOid, oursOid, theirsOid] = await Promise.all(
-          entries.map((e) => (e ? e.oid() : null)),
+        const anyTree = types.some((t) => t === "tree");
+        const anyBlob = types.some((t) => t === "blob");
+
+        // A path that is a directory on every side is just a directory: let the walk
+        // descend and compare its leaves.
+        if (anyTree && !anyBlob) return undefined;
+
+        // A path that is a file on one side and a directory on another is a type
+        // change. Record it with a null oid for the directory sides so it is treated
+        // as changed rather than silently dropped -- skipping it would lose the
+        // change without telling anyone.
+        const oids = await Promise.all(
+          entries.map(async (e, i) => (e && types[i] === "blob" ? e.oid() : null)),
         );
+        const [baseOid, oursOid, theirsOid] = oids;
         rows.push({ path: filepath, baseOid, oursOid, theirsOid });
+        // Still descend if some side is a directory, so its contents are compared too.
         return undefined;
       },
     });
@@ -2607,22 +2618,6 @@ Add these methods inside the `SafeGit` class:
           r.oursOid !== r.baseOid && r.theirsOid !== r.baseOid && r.oursOid !== r.theirsOid,
       )
       .map((r) => r.path);
-  }
-
-  /**
-   * The blob oid for a path at a commit, or null when the path is genuinely absent
-   * there. A read failure throws rather than returning null: callers treat null as
-   * "not present on that side", and swallowing a damaged object as absence would
-   * silently drop a remote change while still recording that commit as merged.
-   */
-  private async blobOid(oid: string, filepath: string): Promise<string | null> {
-    try {
-      const { oid: blobOid } = await git.readBlob({ ...this.base(), oid, filepath });
-      return blobOid;
-    } catch (err) {
-      if (isPathAbsent(err, oid)) return null;
-      throw new Error(`Cannot read ${filepath} at ${oid.slice(0, 7)}: ${message(err)}`);
-    }
   }
 
   /**
@@ -2929,8 +2924,8 @@ export interface ConflictResolution {
 }
 ```
 
-`PendingConflict` and the `pending` field were already declared in Task 9, because
-`mergeSafe` sets them.
+`PendingConflict` and the `pending` field are already declared in Task 7, alongside the
+other class fields; `mergeSafe` (Task 9) is what sets them.
 
 In `mergeSafe`, record the pending conflict. Replace the `return { kind: "conflict", files: conflicts };` line with:
 
