@@ -1031,6 +1031,18 @@ describe("fs-adapter", () => {
     expect((await fs.stat(".")).isDirectory()).toBe(true);
   });
 
+  // Regression: the walker builds working-tree paths as `${dir}/${fullpath}` by string
+  // concatenation rather than with isomorphic-git's own `join`, so with the mobile base
+  // of "" the repo root arrives as "/." and not ".". Verified against real
+  // isomorphic-git 1.41: if this does not map to the vault root, statusMatrix and
+  // checkout both fail with `ENOENT: lstat '.'`.
+  it("maps the repo root to the vault root when it arrives as \"/.\"", async () => {
+    const { adapter, fs } = setup();
+    await adapter.write("a.md", "x");
+    expect((await fs.stat("/.")).isDirectory()).toBe(true);
+    expect(await fs.readdir("/.")).toEqual(["a.md"]);
+  });
+
   it("maps the repo root \".\" to the vault root with a base configured too", async () => {
     const { adapter, fs } = setup("/vault");
     await adapter.write("a.md", "x");
@@ -1277,9 +1289,16 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
     // otherwise statusMatrix and checkout both fail with ENOENT on lstat('.'), and
     // status, clone-safe checkout, and merge are all unreachable. This bites on mobile
     // in particular, where the base path is "" and every path arrives root-relative.
-    if (p === "." || p === "./") return "";
-    while (p.startsWith("./")) p = p.slice(2);
+    //
+    // The leading separators must come off BEFORE the "." test. isomorphic-git's
+    // working-tree walker builds the path as `${dir}/${fullpath}` by concatenation, not
+    // by its own `join`, so with the mobile base of "" the root arrives as "/." rather
+    // than ".". Testing for "." first leaves that as a literal "." path and both
+    // statusMatrix and checkout fail with ENOENT on lstat -- verified against real
+    // isomorphic-git 1.41.
     while (p.startsWith("/")) p = p.slice(1);
+    while (p.startsWith("./")) p = p.slice(2);
+    if (p === ".") return "";
     return p;
   };
 
@@ -1387,7 +1406,7 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/fs-adapter.test.ts`
-Expected: PASS, 18 tests.
+Expected: PASS, 19 tests.
 
 - [ ] **Step 5: Commit**
 
