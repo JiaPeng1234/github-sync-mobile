@@ -271,6 +271,46 @@ all.
 The lesson worth keeping: **a safety claim about a dependency is worthless until someone reads
 the dependency.** This one was repeated across five places and was wrong in all five.
 
+### A user-editable regex is an attack surface on your own phone
+
+The exclude patterns compile to regexes, and `**` became `.*`. Each `**/` group became an
+independent `(?:.*/)?`, so several in a row backtracked exponentially in the *depth of the path
+being tested* — not in pattern length. Measured before the fix: twelve `**/` groups took 4.1
+seconds for one path at depth 30, and filtering 2000 paths took **18 seconds**. There is no
+timeout anywhere in the sync path, so that is a frozen phone with nothing to explain itself.
+The shipped defaults were never affected (20,000 paths in 6 ms); only hand-written patterns.
+
+Fixed by collapsing runs of `**/` into one, which is semantically free — consecutive "any number
+of directories" groups say nothing more than one of them does.
+
+Worth noting the shape that is dangerous is not the obvious one. `**a**a**a**a**` completes in
+0.03 ms because it matches immediately. The expensive case is many `**/` groups against a deep
+path that does *not* match.
+
+### A dropped slash was a token leak
+
+`.obsidian/` excluded the directory and its contents; bare `.obsidian` excluded only the
+directory entry, and silently synced everything inside it. Since `.obsidian/plugins/<id>/data.json`
+holds the GitHub token in plaintext, a user tidying their exclude list and removing one character
+would have published their credentials. Every pattern now also matches everything beneath what it
+matched, which is what .gitignore does for a pattern naming a directory.
+
+The same rework made `**/` match zero directories as well as many, so `**/*.png` now covers a
+root-level `a.png` — what a user writing that pattern means.
+
+### The sentinel that must not be printable
+
+Translating `**` before `*` needs a placeholder. It has to be a character that cannot occur in a
+vault path: a printable stand-in such as a space would itself be rewritten into `.*`, so the
+pattern `My Notes` would compile to `^My.*Notes$` and match `My/Notes/a.md`. In an exclude engine
+over-matching is not a cosmetic bug — the file is simply never pushed, which is a silent backup
+loss.
+
+The placeholders are NUL and SOH, written as `\u0000`/`\u0001` escapes rather than literal
+bytes. A literal control byte makes the file read as binary to `grep` and `file`, and gets
+stripped by copy-paste — which is exactly how it went wrong twice: once in the plan text, and
+once again when that text was pasted into a task briefing.
+
 ### A test that cannot fail is not a test
 
 Two binary tests used **add/add** shapes, where the file is absent at the merge base. The engine
