@@ -896,11 +896,20 @@ Three constraints inherited from earlier tasks, all load-bearing:
   the same path, so writing to a path held by a folder rejects with `code: "EISDIR"` and
   `mkdir` at or under an existing file rejects with `code: "ENOTDIR"`. Map or propagate these;
   do not swallow them.
-- **Keep `ENOENT` and `ENOTDIR` distinct in `readdir`.** isomorphic-git turns either into `null`
-  to tell "absent or not a directory" apart from "an empty directory". If the bridge collapsed
-  them, or returned an empty array for an absent path, a tree walk would read a missing subtree
-  as an empty one — that is, as deleted. An existing empty directory must list as empty; an
-  absent one must throw.
+- **Record unexpected read failures, because no error code can save you here.**
+  isomorphic-git's `readdir` maps only `ENOTDIR` to `null` and swallows **everything else,
+  including `ENOENT`, as `[]`** — an empty directory. So a directory read that fails for a
+  transient reason is indistinguishable from an empty directory at the walker, and every file
+  beneath it is reported as deleted. That deletion then flows into commit and push: a durable
+  removal of files that still exist.
+
+  No choice of error code fixes this, so the bridge exposes the failure out of band. Alongside
+  `promises`, `createFs` returns a `readFailures` list and a `clearReadFailures()`. The bridge
+  records a path whenever a read fails for a reason that is *not* genuine absence — notably when
+  `stat` says a path is a folder but `list` then throws. `SafeGit` clears the list before
+  computing status and refuses to proceed if anything landed in it. Still throw with the right
+  code (`ENOENT` for missing, `ENOTDIR` for a file path) — the codes matter for the write-retry
+  path — but do not rely on them being visible to the walker.
 
 Two further gotchas were real bugs in the prior plugin and are covered by tests:
 
@@ -949,6 +958,21 @@ describe("fs-adapter", () => {
     const out = await fs.readFile("a.bin");
     expect(out instanceof Uint8Array).toBe(true);
     expect(Array.from(out as Uint8Array)).toEqual([1, 2, 3]);
+  });
+
+  // isomorphic-git hands "." to the fs for working-tree walks. Left unmapped it
+  // reaches Obsidian as a path that does not exist, and statusMatrix/checkout throw.
+  it("maps the repo root \".\" to the vault root", async () => {
+    const { adapter, fs } = setup();
+    await adapter.write("a.md", "x");
+    expect(await fs.readdir(".")).toEqual(["a.md"]);
+    expect((await fs.stat(".")).isDirectory()).toBe(true);
+  });
+
+  it("maps the repo root \".\" to the vault root with a base configured too", async () => {
+    const { adapter, fs } = setup("/vault");
+    await adapter.write("a.md", "x");
+    expect(await fs.readdir(".")).toEqual(["a.md"]);
   });
 
   it("maps the vault root to an empty path when a base is configured", async () => {
@@ -1083,6 +1107,19 @@ export type VaultAdapter = Pick<
   | "remove"
 >;
 
+export interface FsPromises {
+  readFile(path: string, options?: unknown): Promise<string | Uint8Array>;
+  writeFile(path: string, data: string | Uint8Array, options?: unknown): Promise<void>;
+  unlink(path: string): Promise<void>;
+  readdir(path: string): Promise<string[]>;
+  mkdir(path: string): Promise<void>;
+  rmdir(path: string): Promise<void>;
+  stat(path: string): Promise<StatsLike>;
+  lstat(path: string): Promise<StatsLike>;
+  readlink(path: string): Promise<string>;
+  symlink(): Promise<void>;
+}
+
 interface StatsLike {
   type: "file" | "dir";
   size: number;
@@ -1147,8 +1184,24 @@ function wantsText(options: unknown): boolean {
  * `base` is the vault's absolute path on desktop and "" on mobile. All paths
  * handed to the adapter must be vault-relative.
  */
-export function createFs(adapter: VaultAdapter, base: string) {
+export interface VaultFs {
+  promises: FsPromises;
+  /** Paths whose read failed for a reason other than genuine absence. */
+  readonly readFailures: readonly string[];
+  clearReadFailures(): void;
+}
+
+export function createFs(adapter: VaultAdapter, base: string): VaultFs {
   const normBase = base.replace(/\\/g, "/").replace(/\/+$/, "");
+
+  /**
+   * Reads that failed for a reason other than the path being absent.
+   *
+   * isomorphic-git cannot see these — its `readdir` reports any failure as an empty
+   * directory — so they are surfaced here instead and checked by SafeGit before it trusts
+   * a status. See the note above `readdir`.
+   */
+  const readFailures: string[] = [];
 
   const rel = (abs: string): string => {
     let p = abs.replace(/\\/g, "/");
@@ -1157,6 +1210,12 @@ export function createFs(adapter: VaultAdapter, base: string) {
       if (p === normBase) return "";
       if (p.startsWith(`${normBase}/`)) p = p.slice(normBase.length + 1);
     }
+    // isomorphic-git normalises the repo root to "." and passes that through for
+    // working-tree walks. Obsidian addresses the root as "", so "." must map to "" --
+    // otherwise statusMatrix and checkout both fail with ENOENT on lstat('.'), and
+    // status, clone-safe checkout, and merge are all unreachable. This bites on mobile
+    // in particular, where the base path is "" and every path arrives root-relative.
+    if (p === "." || p === "./") return "";
     while (p.startsWith("./")) p = p.slice(2);
     while (p.startsWith("/")) p = p.slice(1);
     return p;
@@ -1203,7 +1262,16 @@ export function createFs(adapter: VaultAdapter, base: string) {
         if (!st) throw enoent(path);
         if (st.type !== "folder") throw enotdir(path);
       }
-      const listing = await adapter.list(p);
+      // A failure here is invisible to isomorphic-git, which will read it as an empty
+      // directory and conclude everything beneath was deleted. Record it so SafeGit can
+      // refuse, then rethrow.
+      let listing: { files: string[]; folders: string[] };
+      try {
+        listing = await adapter.list(p);
+      } catch (err) {
+        readFailures.push(p);
+        throw err;
+      }
       const base = p === "" ? "" : `${p}/`;
       return [...listing.files, ...listing.folders].map((f) =>
         f.startsWith(base) ? f.slice(base.length) : f,
@@ -1242,14 +1310,22 @@ export function createFs(adapter: VaultAdapter, base: string) {
     },
   };
 
-  return { promises };
+  return {
+    promises,
+    get readFailures() {
+      return readFailures;
+    },
+    clearReadFailures() {
+      readFailures.length = 0;
+    },
+  };
 }
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/fs-adapter.test.ts`
-Expected: PASS, 12 tests.
+Expected: PASS, 18 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1307,6 +1383,7 @@ function capture(status = 200, responseBody = "ok") {
       headers: { "content-type": "application/x-git-upload-pack-result" },
       arrayBuffer: new TextEncoder().encode(responseBody).buffer as ArrayBuffer,
       text: responseBody,
+      json: undefined,
     };
   });
   return calls;
@@ -1522,7 +1599,17 @@ export async function makeHarness(
     exclude: compileExcludes(excludes),
   });
 
+  /**
+   * Writes a working-tree file, creating parent folders first.
+   *
+   * The adapter deliberately refuses to invent parents, matching the real one. Real git
+   * copes because isomorphic-git catches the failed write, mkdirs, and retries — but this
+   * helper bypasses git, so it has to do that itself. Without this, `initRepo`'s first
+   * line fails and with it every test in Tasks 7 through 12.
+   */
   const write = async (path: string, content: string) => {
+    const i = path.lastIndexOf("/");
+    if (i > 0) await adapter.mkdir(path.slice(0, i));
     await adapter.write(path, content);
   };
 
@@ -1633,6 +1720,33 @@ describe("SafeGit.status", () => {
     expect(s.changed).toEqual([]);
   });
 
+  /**
+   * The guard for a hazard the git layer cannot see. isomorphic-git's readdir reports any
+   * read failure other than ENOTDIR as an EMPTY directory, so a transient failure makes
+   * every file beneath look deleted while the files are still on disk. Committing that
+   * would push a deletion of files that exist.
+   */
+  it("refuses to report a status when a directory read failed", async () => {
+    const h = await makeHarness();
+    await initRepo(h);
+    h.adapter.failReadsAt("notes", "EIO");
+
+    await expect(h.safeGit.status()).rejects.toThrow(/refusing to continue/i);
+
+    h.adapter.clearReadFailures();
+    expect((await h.safeGit.status()).changed).toEqual([]);
+  });
+
+  it("refuses to commit a deletion for a file that is still on disk", async () => {
+    const h = await makeHarness();
+    await initRepo(h);
+    // The file is present, but the scan will claim it is gone.
+    h.adapter.failReadsAt("notes", "EIO");
+    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/nothing was changed/i);
+    h.adapter.clearReadFailures();
+    expect(await h.adapter.read("notes/a.md")).toBe("first\n");
+  });
+
   it("reports a genuine deletion of a non-excluded file", async () => {
     const h = await makeHarness();
     await initRepo(h);
@@ -1674,6 +1788,7 @@ Expected: FAIL — cannot resolve `../../src/git/safe-git`.
 ```ts
 import git, { TREE } from "isomorphic-git";
 import type { ExcludeMatcher } from "./exclude";
+import type { VaultFs } from "./fs-adapter";
 import type { ConflictFile, RepoStatus } from "../types";
 import { COMMIT_AUTHOR } from "../constants";
 
@@ -1696,7 +1811,8 @@ interface PendingConflict {
 }
 
 export interface SafeGitOptions {
-  fs: unknown;
+  /** The bridge from `createFs`. Typed so its read-failure channel stays reachable. */
+  fs: VaultFs;
   http: unknown;
   /** Repo working directory. "" is the vault root on mobile. */
   dir: string;
@@ -1719,7 +1835,10 @@ export interface SafeGitOptions {
  * parameter that could turn a safe call into a clobbering one.
  */
 export class SafeGit {
+  /** Passed to isomorphic-git, which only ever touches `.promises`. */
   private readonly fs: never;
+  /** The same object, typed so `readFailures` and `promises` are reachable. */
+  private readonly fsChannel: VaultFs;
   private readonly http: never;
   private readonly dir: string;
   private readonly url: string;
@@ -1731,7 +1850,8 @@ export class SafeGit {
   private pending: PendingConflict | null = null;
 
   constructor(opts: SafeGitOptions) {
-    this.fs = opts.fs as never;
+    this.fs = opts.fs as unknown as never;
+    this.fsChannel = opts.fs;
     this.http = opts.http as never;
     this.dir = opts.dir;
     this.url = opts.url;
@@ -1793,9 +1913,7 @@ export class SafeGit {
 
   /** Recursively lists non-excluded working-tree files. */
   private async listWorkingFiles(prefix: string): Promise<string[]> {
-    const fs = this.fs as unknown as {
-      promises: { readdir(p: string): Promise<string[]>; stat(p: string): Promise<{ isDirectory(): boolean }> };
-    };
+    const fs = this.fsChannel;
     const out: string[] = [];
     let entries: string[];
     try {
@@ -1827,10 +1945,7 @@ export class SafeGit {
    * deletion and pushed, removing it from the remote.
    */
   async status(): Promise<RepoStatus> {
-    const matrix = await git.statusMatrix({
-      ...this.base(),
-      filter: (f) => !this.exclude.isExcluded(f),
-    });
+    const matrix = await this.scanWorkingTree();
 
     const changed = matrix
       .filter(([, head, workdir, stage]) => !(head === 1 && workdir === 1 && stage === 1))
@@ -1839,6 +1954,37 @@ export class SafeGit {
 
     const { ahead, behind } = await this.aheadBehind();
     return { changed, ahead, behind };
+  }
+
+  /**
+   * Runs `statusMatrix`, refusing the result if any directory read failed.
+   *
+   * This is the guard for a hazard nothing downstream can see. isomorphic-git's `readdir`
+   * reports any read failure other than ENOTDIR as an *empty directory*, so a transient
+   * failure — iOS suspending the app, memory pressure — makes every file beneath that
+   * folder look deleted, while the files are still on disk. Committing that status would
+   * push a deletion of files that exist.
+   *
+   * The fs bridge records such failures out of band; if any occurred, the scan is not
+   * trustworthy and we stop rather than guess.
+   */
+  private async scanWorkingTree(): Promise<Array<[string, number, number, number]>> {
+    this.fsChannel.clearReadFailures();
+    const matrix = (await git.statusMatrix({
+      ...this.base(),
+      filter: (f) => !this.exclude.isExcluded(f),
+    })) as Array<[string, number, number, number]>;
+
+    const failed = this.fsChannel.readFailures;
+    if (failed.length > 0) {
+      throw new Error(
+        `Could not read ${failed.length} path(s) while scanning the vault ` +
+          `(${failed.slice(0, 3).join(", ")}). Refusing to continue, because an ` +
+          `unreadable folder is indistinguishable from an empty one and would look ` +
+          `like you had deleted its contents. Nothing was changed — try again.`,
+      );
+    }
+    return matrix;
   }
 
   private async aheadBehind(): Promise<{ ahead: number; behind: number }> {
@@ -1859,6 +2005,16 @@ export class SafeGit {
     return new Set(commits.map((c) => c.oid));
   }
 
+  /** True when the path is still present in the working tree. */
+  private async stillOnDisk(filepath: string): Promise<boolean> {
+    try {
+      await this.fsChannel.promises.stat(this.join(filepath));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async tryResolve(ref: string): Promise<string | null> {
     try {
       return await git.resolveRef({ ...this.base(), ref });
@@ -1876,7 +2032,8 @@ export class SafeGit {
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/safe-git-status.test.ts`
-Expected: PASS, 11 tests. The phantom-deletion test is the important one.
+Expected: PASS, 13 tests. The phantom-deletion test and the two read-failure refusals are
+the important ones.
 
 - [ ] **Step 6: Commit**
 
@@ -2005,10 +2162,7 @@ Insert these methods inside the `SafeGit` class, before the closing brace:
    * Returns the new commit oid, or null when there was nothing to commit.
    */
   async commitLocal(message: string): Promise<string | null> {
-    const matrix = await git.statusMatrix({
-      ...this.base(),
-      filter: (f) => !this.exclude.isExcluded(f),
-    });
+    const matrix = await this.scanWorkingTree();
 
     let staged = 0;
     for (const [filepath, head, workdir] of matrix) {
@@ -2016,7 +2170,15 @@ Insert these methods inside the `SafeGit` class, before the closing brace:
       if (head === 1 && workdir === 1) continue;
 
       if (workdir === 0) {
-        // Gone from the working tree: stage the deletion.
+        // Belt and braces on top of scanWorkingTree's guard: confirm the file really is
+        // gone before staging its removal. A `workdir === 0` that came from a swallowed
+        // directory-read failure would otherwise commit a deletion of a file that exists.
+        if (await this.stillOnDisk(filepath)) {
+          throw new Error(
+            `${filepath} is reported as deleted but is still present. Refusing to ` +
+              `commit a deletion that may be a read failure. Nothing was changed.`,
+          );
+        }
         await git.remove({ ...this.base(), filepath });
         staged += 1;
       } else {
@@ -3051,13 +3213,7 @@ Then add these methods to the class:
    * side deleted the file, so the deletion is what gets staged.
    */
   private async materialise(filepath: string, side: ConflictSide): Promise<void> {
-    const fs = this.fs as unknown as {
-      promises: {
-        writeFile(p: string, d: string | Uint8Array): Promise<void>;
-        unlink(p: string): Promise<void>;
-        mkdir(p: string): Promise<void>;
-      };
-    };
+    const fs = this.fsChannel;
 
     if (side.state === "absent") {
       try {
@@ -3687,6 +3843,7 @@ function respond(map: Record<string, { status: number; body: unknown }>) {
       headers: {},
       arrayBuffer: new TextEncoder().encode(text).buffer as ArrayBuffer,
       text,
+      json: entry.body,
     };
   });
   return calls;
@@ -4832,8 +4989,23 @@ Phase 2: line-level conflict merging.
 
 ## License
 
-GPL-3.0
+GPL-3.0-or-later. Copyright (C) 2026 Peng Jia.
+
+Bundled dependencies: `isomorphic-git` (MIT) and `buffer` (MIT). `main.js` is a minified
+bundle; their notices are reproduced in `THIRD-PARTY-NOTICES.md`.
 ```
+
+- [ ] **Step 2b: Create `THIRD-PARTY-NOTICES.md`**
+
+GPL-3.0 is compatible with MIT, but MIT requires its notice to travel with redistributed
+copies — and `main.js` is a minified bundle that drops them. Reproduce the `isomorphic-git`
+and `buffer` licence texts (copy them from `node_modules/<pkg>/LICENSE`) so the release
+artifacts satisfy that.
+
+Note the `LICENSE` file itself must NOT be edited: the `<year> <name of author>` placeholders
+near the end sit inside the GPL's own "How to Apply These Terms" appendix, which is part of the
+licence text and is meant to stay verbatim. The real copyright notice belongs in the README
+above.
 
 - [ ] **Step 3: Verify the full pipeline**
 

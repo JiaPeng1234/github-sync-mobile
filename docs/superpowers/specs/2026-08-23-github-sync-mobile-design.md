@@ -92,8 +92,9 @@ main.ts                  lifecycle: load settings, wire UI, own the single GitSe
 │
 ├── git/
 │   ├── safe-git.ts      THE CHOKEPOINT. The only file that imports isomorphic-git.
-│   │                    Exports ONLY safe ops: connect, cloneSafe, fetchAndMerge,
-│   │                    commit, push, status, resolveConflictWholeFile.
+│   │                    Exports ONLY safe ops: decideConnect, cloneSafe, initAndPush,
+│   │                    status, commitLocal, fetch, mergeSafe, resolveConflicts,
+│   │                    abandonConflict, push.
 │   │                    force-checkout / bare-merge / bare-pull are private, NOT exported.
 │   ├── fs-adapter.ts    Obsidian DataAdapter → isomorphic-git `fs` (promises shape)
 │   ├── http-client.ts   isomorphic-git http client routed through Obsidian `requestUrl`
@@ -134,11 +135,22 @@ These are non-negotiable and centrally enforced.
 5. **"Local is empty" means: no non-excluded files exist.** A `.obsidian/` created by
    installing the plugin via BRAT does not count as content.
 6. **A vault already connected to one repo refuses to connect to another.** Disconnect first.
-7. **Multiple merge bases / unrelated histories are caught and treated as a conflict**
-   (safe stop), never allowed to crash or improvise.
+7. **Multiple merge bases and unrelated histories are caught and reported as `unmergeable`**
+   — a distinct outcome from a conflict, never a crash and never improvisation. They are kept
+   distinct because they demand different responses: a conflict is resolvable per file in the
+   app, whereas an unmergeable history cannot be resolved here at all. Collapsing them forced
+   consumers to discriminate on `files.length` instead of on the outcome tag.
 8. **Every step is idempotent.** Re-running Sync from any interrupted state must be safe.
    The commit→fetch→merge→push ordering means any interruption *between* steps leaves a
    valid git state; the dry-run rule means we never leave a half-merged working tree.
+9. **A failed read is never a deletion — including a failed *directory* read.**
+   isomorphic-git's `readdir` maps only `ENOTDIR` to `null` and swallows every other error,
+   `ENOENT` included, as `[]` — an empty directory. A transient failure therefore makes every
+   file beneath a folder look deleted while the files are still on disk, and committing that
+   would push a removal of files that exist. No error code is visible to the walker, so the
+   filesystem bridge records such failures out of band and `SafeGit` refuses any status it
+   cannot trust. Every staged deletion is additionally confirmed against the working tree
+   before it may be committed.
 
 **Logging.** The dry-run *probe* is permanent — it is a safety mechanism. The on-screen
 *verbose narration* is behind a setting, **default off**, enabled during bring-up and mobile

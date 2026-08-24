@@ -71,11 +71,16 @@ describe("obsidian stub requestUrl", () => {
     await expect(requestUrl({ url: "u" })).rejects.toThrow(/no handler installed/);
   });
 
-  it("throws on a 400+ status by default, carrying the status", async () => {
+  it("throws on a 400+ status by default, naming the status in the message", async () => {
     // The statuses GitHub returns exactly where this plugin's safety decisions live.
+    // Asserted on the message, not on an `err.status` property: the real typings
+    // promise no such property, and a stub that provided one would let production code
+    // key on it, pass here, and read undefined on a device.
     for (const status of [401, 403, 409, 500]) {
       setRequestUrlHandler(async () => response({ status }));
-      await expect(requestUrl({ url: "u" })).rejects.toMatchObject({ status });
+      await expect(requestUrl({ url: "u" })).rejects.toThrow(
+        new RegExp(`status ${status}`),
+      );
     }
   });
 

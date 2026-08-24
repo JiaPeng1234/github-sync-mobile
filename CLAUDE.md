@@ -32,7 +32,7 @@ When choosing between convenient and cannot-lose-data, choose the latter.
 
 ```bash
 npx tsc --noEmit   # expect exit 0
-npx vitest run     # expect 29 passed
+npx vitest run     # expect 32 passed
 ```
 
 `npm run build` fails until `src/main.ts` exists (Task 18). That is expected.

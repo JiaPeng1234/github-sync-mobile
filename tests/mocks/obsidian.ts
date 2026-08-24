@@ -75,11 +75,12 @@ export function resetRequestUrlHandler(): void {
 export async function requestUrl(p: RequestUrlParam): Promise<RequestUrlResponse> {
   const res = await handler(p);
   if (p.throw !== false && res.status >= 400) {
-    const e = new Error(`Request failed, status ${res.status}`) as Error & {
-      status: number;
-    };
-    e.status = res.status;
-    throw e;
+    // A bare Error, deliberately. The real typings promise no `status` property on
+    // this error, so attaching one would let a test key on `err.status`, pass, and
+    // ship behaviour the device does not provide. The stub must never be more
+    // generous than the API it stands in for. Pass `throw: false` and read
+    // `res.status` instead -- which is what both clients do.
+    throw new Error(`Request failed, status ${res.status}`);
   }
   return res;
 }

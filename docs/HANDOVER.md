@@ -17,7 +17,7 @@ it points at.
 An Obsidian plugin that syncs a vault to the user's own **private** GitHub repo, **from an
 iPhone**, with manual git-like operations.
 
-The repo: https://github.com/JiaPeng1234/github-sync-mobile · GPL-3.0 · plugin id
+The repo: https://github.com/JiaPeng1234/github-sync-mobile · GPL-3.0-or-later · plugin id
 `github-sync-mobile`.
 
 **The defining requirement is not "sync". It is never silently losing data.** The author's previous
@@ -38,7 +38,7 @@ exists is the toolchain, the test harness, and the shared vocabulary.
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
 src/constants.ts    Task 3 — defaults, TIMESTAMP_TOKEN, COMMIT_AUTHOR, repoUrl + isValidSegment
-tests/mocks/        Task 2 — obsidian stub, in-memory DataAdapter, 29 tests
+tests/mocks/        Task 2 — obsidian stub, in-memory DataAdapter, 32 tests
 package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill for iOS
 ```
 
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 29 passed
+npx vitest run       # expect 32 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -140,10 +140,19 @@ lifecycle) need the `override` keyword. Let `tsc` settle the exact set — abstr
 carry it.
 
 **The test filesystem is deliberately strict.** It refuses to create parent directories on write,
-and `list()` throws for a missing path and for a file path. Both mirror the real adapter. If real
-isomorphic-git turns out not to recover from one of these, **report it — do not loosen the
-adapter.** Where the mock is stricter than reality the failure mode is a false test failure, never
-a false pass.
+and `list()` throws for a missing path and for a file path. Both mirror the real adapter. Real
+isomorphic-git recovers from the write case on its own (it catches the failure, mkdirs the parent,
+and retries — verified), so keep the strictness. Where the mock is stricter than reality the
+failure mode is a false test failure, never a false pass.
+
+**But error codes do not reach the git layer on the read path.** isomorphic-git's `readdir` maps
+only `ENOTDIR` to `null` and swallows everything else — `ENOENT` included — as `[]`, an empty
+directory. So a directory read that fails transiently is indistinguishable from an empty folder,
+and every file beneath it is reported as **deleted**. That is why the fs bridge exposes a
+`readFailures` channel out of band and `SafeGit` refuses any status it cannot trust, and why every
+staged deletion is confirmed against the working tree first. `MemoryAdapter.failReadsAt(path, code)`
+exists so this is testable. Do not assume an error code you throw will be visible downstream —
+check the library.
 
 **Excluded paths are inert in both directions, and never register as deletions.** The remote may
 already track `.obsidian/*`. A naive status computation sees "in HEAD, absent from disk" and
@@ -153,6 +162,12 @@ paths from status entirely.
 **Excluding `.obsidian/` is a security requirement.** The PAT lives in
 `.obsidian/plugins/github-sync-mobile/data.json` in plaintext. Syncing that directory publishes the
 token.
+
+**`lib: ["ES2018","DOM"]` does not actually enforce ES2018.** `types: ["node"]` pulls in
+`@types/node`'s own `lib="es2020"` reference, so `Array.flat`, `Object.fromEntries` and
+`Promise.allSettled` typecheck silently. esbuild downlevels *syntax*, not APIs. In practice
+Obsidian mobile runs a modern WebView so this is low risk, but do not treat a clean `tsc` as
+proof that an API is available on device.
 
 **Binary content must never pass through a string.** See §5.
 
@@ -182,13 +197,16 @@ a safe call into a clobbering one.
 
 Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-and-learnings.md):
 
-9. **Binary content never passes through a string.** A non-fatal `TextDecoder` replaces invalid
+9. **A failed read is never a deletion — including a failed directory read.** See the note above
+   about `readdir` swallowing errors as an empty listing. Guarded by the bridge's `readFailures`
+   channel plus per-deletion confirmation, not by error codes.
+10. **Binary content never passes through a string.** A non-fatal `TextDecoder` replaces invalid
    UTF-8 with U+FFFD irreversibly. `ConflictSide` is `absent | text | binary | unreadable`; bytes
    stay bytes; text is decoded only with a **fatal** decoder, which is also how binary is detected.
    And before the engine merges anything, a pre-screen refuses to let it touch a file changed on
    both sides that is binary in any of base/ours/theirs — because isomorphic-git's own merge does
    the same lossy round trip internally and reports a *clean* merge while doing it.
-10. **"Could not read" is never "was deleted."** Resolution acts on `absent` by unlinking and
+11. **"Could not read" is never "was deleted."** Resolution acts on `absent` by unlinking and
     committing, so a torn packfile must not be classified as a deletion. `isPathAbsent` discriminates
     on the *shape* of `data.what` — a bare 40-hex string is a missing object, anything else is a
     missing path.

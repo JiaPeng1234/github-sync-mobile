@@ -227,4 +227,35 @@ describe("MemoryAdapter", () => {
     expect(await a.exists("d")).toBe(false);
     expect(a.paths()).toEqual(["d/1.md"]);
   });
+
+  it("injects a read failure at a chosen path and clears it again", async () => {
+    const a = new MemoryAdapter();
+    await a.write("a.md", "x");
+    a.failReadsAt("a.md", "EIO");
+    await expect(a.read("a.md")).rejects.toMatchObject({ code: "EIO" });
+    a.clearReadFailures();
+    expect(await a.read("a.md")).toBe("x");
+  });
+
+  it("injects a directory read failure, which is the hazard SafeGit must guard", async () => {
+    const a = new MemoryAdapter();
+    await a.mkdir("notes");
+    await a.write("notes/a.md", "x");
+    a.failReadsAt("notes", "EIO");
+    await expect(a.list("notes")).rejects.toMatchObject({ code: "EIO" });
+    // The file is still there -- the failure is transient, not a deletion.
+    a.clearReadFailures();
+    expect((await a.list("notes")).files).toEqual(["notes/a.md"]);
+  });
+
+  it("snapshots content, not just which paths exist", async () => {
+    const a = new MemoryAdapter();
+    await a.write("a.md", "before");
+    const before = a.snapshot();
+    await a.write("a.md", "after");
+    const after = a.snapshot();
+    expect([...before.keys()]).toEqual([...after.keys()]);
+    expect(new TextDecoder().decode(before.get("a.md")!)).toBe("before");
+    expect(new TextDecoder().decode(after.get("a.md")!)).toBe("after");
+  });
 });

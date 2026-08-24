@@ -14,10 +14,16 @@ interface StoredFolder {
 /**
  * An error carrying a `code` property, like Node's fs errors.
  *
- * The code is load-bearing, not decorative. isomorphic-git's write helper catches a
- * failed write, calls `mkdir` on the parent, and retries, keying that recovery on the
- * code rather than the message; its `readdir` converts ENOENT/ENOTDIR into `null` to
- * distinguish "absent or not a directory" from "an empty directory".
+ * The code is load-bearing for writes: isomorphic-git's write helper catches a failed
+ * write, calls `mkdir` on the parent, and retries, keying that recovery on the code
+ * rather than the message.
+ *
+ * It is NOT load-bearing for reads, and the difference matters. isomorphic-git's
+ * `readdir` maps ENOTDIR to `null` but swallows every other error -- including ENOENT --
+ * as `[]`, an empty directory. So a failed directory read is indistinguishable from an
+ * empty one at the walker, which reports every file beneath as deleted. Nothing the
+ * adapter or the bridge does with error codes can fix that; the guard has to live above
+ * it, in SafeGit. See `readFailures` in the fs bridge.
  */
 function fsError(code: "ENOENT" | "ENOTDIR" | "EISDIR", message: string): Error {
   const e = new Error(`${code}: ${message}`) as Error & { code: string };
@@ -48,8 +54,8 @@ function fsError(code: "ENOENT" | "ENOTDIR" | "EISDIR", message: string): Error 
  *   - `remove()` on a folder path throws ENOENT rather than the platform's error, since
  *     it only ever consults `files`.
  *   - `list("f.md/sub")` -- a path *under* a file -- gives ENOENT where a real
- *     filesystem gives ENOTDIR. isomorphic-git collapses both into `null`, so no branch
- *     changes; distinguishing them would mean walking every ancestor on each call.
+ *     filesystem gives ENOTDIR. Distinguishing them would mean walking every ancestor on
+ *     each call, and neither reaches the walker as a distinct value anyway.
  */
 export class MemoryAdapter {
   private files = new Map<string, StoredFile>();
@@ -64,6 +70,46 @@ export class MemoryAdapter {
 
   private tick(): number {
     return (this.clock += 1000);
+  }
+
+  /**
+   * Paths whose next read should fail, and with which code.
+   *
+   * Exists so tests can express a transient read failure — the hazard that a directory
+   * read failing is indistinguishable from the directory being empty, which makes every
+   * file beneath it look deleted. Without injection there is no way to assert that the
+   * plugin refuses rather than committing those phantom deletions.
+   */
+  private failures = new Map<string, "ENOENT" | "ENOTDIR" | "EIO">();
+
+  /** Makes the next read of `path` fail with `code`, until cleared. */
+  failReadsAt(path: string, code: "ENOENT" | "ENOTDIR" | "EIO" = "EIO"): void {
+    this.failures.set(path, code);
+  }
+
+  clearReadFailures(): void {
+    this.failures.clear();
+  }
+
+  private throwIfInjected(path: string): void {
+    const code = this.failures.get(path);
+    if (!code) return;
+    const e = new Error(`${code}: injected read failure at '${path}'`) as Error & {
+      code: string;
+    };
+    e.code = code;
+    throw e;
+  }
+
+  /**
+   * Full content snapshot of the working tree.
+   *
+   * `paths()` only reports which files exist, so a "nothing was touched" assertion built
+   * on it would miss a file whose bytes changed. Compare snapshots when the claim is
+   * that the tree is untouched.
+   */
+  snapshot(): Map<string, Uint8Array> {
+    return new Map([...this.files].map(([k, v]) => [k, v.data.slice()]));
   }
 
   private parentOf(path: string): string {
@@ -120,12 +166,14 @@ export class MemoryAdapter {
   }
 
   async read(path: string): Promise<string> {
+    this.throwIfInjected(path);
     const f = this.files.get(path);
     if (!f) throw fsError("ENOENT", path);
     return new TextDecoder().decode(f.data);
   }
 
   async readBinary(path: string): Promise<ArrayBuffer> {
+    this.throwIfInjected(path);
     const f = this.files.get(path);
     if (!f) throw fsError("ENOENT", path);
     return f.data.slice().buffer;
@@ -136,6 +184,7 @@ export class MemoryAdapter {
   }
 
   async stat(path: string): Promise<Stat | null> {
+    this.throwIfInjected(path);
     const f = this.files.get(path);
     if (f) {
       return { type: "file", ctime: f.ctime, mtime: f.mtime, size: f.data.byteLength };
@@ -157,6 +206,7 @@ export class MemoryAdapter {
    * deleted-files bug hides from a test that is supposed to catch it.
    */
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    this.throwIfInjected(path);
     if (path !== "" && !this.folders.has(path)) {
       throw this.files.has(path)
         ? fsError("ENOTDIR", `'${path}' is a file, not a folder`)

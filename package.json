@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Manual, safe GitHub sync for Obsidian on mobile",
   "main": "main.js",
-  "license": "GPL-3.0",
+  "license": "GPL-3.0-or-later",
   "private": true,
   "scripts": {
     "dev": "node esbuild.config.mjs",

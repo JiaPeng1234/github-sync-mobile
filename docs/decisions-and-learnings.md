@@ -155,9 +155,14 @@ Correction for the record: an intermediate commit message claimed the old config
 
 - **It invented parent directories on write.** The real adapter fails with ENOENT. A bridge that
   forgot a `mkdir` would have passed tests and failed only on a phone.
-- **`list()` could never fail.** The real adapter throws for a missing path. isomorphic-git turns
-  that throw into `null`, which is how it distinguishes "absent" from "an empty directory".
-  Collapsing them makes a tree walk read a vanished subtree as *deleted*.
+- **`list()` could never fail.** The real adapter throws for a missing path, and the mock
+  returned an empty listing instead, so a bridge bug could not surface. Made strict.
+
+  A later round corrected the *reason* originally given for this. The claim was that
+  isomorphic-git turns a throwing `readdir` into `null`, distinguishing "absent" from "empty".
+  It does not: it maps only `ENOTDIR` to `null` and swallows everything else, `ENOENT`
+  included, as `[]`. See "A failed directory read is not a deletion" below — the property was
+  real, the stated mechanism was not, and the gap was genuinely unguarded.
 
 Both are now strict. Where the mock is stricter than reality, the failure mode is a false test
 failure — never a false pass.
@@ -234,6 +239,37 @@ truncated object.
 One residual, now guarded: `_readBlob` does not expand its oid argument, so an abbreviated oid or a
 ref name such as `"main"` reports itself in `data.what` and would read as a missing path. A
 non-40-hex oid now answers `false`, routing to `unreadable`, which refuses rather than deletes.
+
+### A failed directory read is not a deletion — and the documented safeguard did not exist
+
+Two committed code comments, a test comment, this log, and the plan all asserted that
+isomorphic-git converts a throwing `readdir` into `null`, which is what separates "absent"
+from "an empty directory". Reading the source settled it:
+
+```js
+catch (err) { if (err.code === 'ENOTDIR') return null
+              return [] }          // ENOENT, EIO, anything else
+```
+
+Only `ENOTDIR` becomes `null`. Everything else becomes an **empty directory** — exactly the
+collapse the strictness had been introduced to prevent. Demonstrated: with a folder intact but
+its read throwing `EIO`, `statusMatrix` reported every file beneath it as deleted while the
+files were still on disk. That status feeds commit, which pushes. A durable remote deletion of
+files that exist, from a transient failure — the same class as "could not read is never was
+deleted", one level up, and completely unguarded.
+
+Notably a failing `stat` aborts loudly; only the `readdir` path fails silently, and silently
+in the deleting direction.
+
+Since no error code reaches the walker, the guard has to sit above it. The filesystem bridge
+now records reads that failed for a reason other than genuine absence, `SafeGit` clears that
+list before scanning and refuses any status it cannot trust, and every staged deletion is
+independently confirmed against the working tree first. The in-memory adapter gained a
+failure-injection hook, because until then the property could not be expressed as a test at
+all.
+
+The lesson worth keeping: **a safety claim about a dependency is worthless until someone reads
+the dependency.** This one was repeated across five places and was wrong in all five.
 
 ### A test that cannot fail is not a test
 
