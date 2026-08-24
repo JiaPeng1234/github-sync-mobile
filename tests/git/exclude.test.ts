@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { compileExcludes } from "../../src/git/exclude";
+import { compileExcludes, matchesEverything } from "../../src/git/exclude";
 import { DEFAULT_EXCLUDES } from "../../src/constants";
 
 describe("compileExcludes", () => {
@@ -132,5 +132,49 @@ describe("compileExcludes", () => {
     const started = performance.now();
     expect(m.filter(paths).length).toBe(3000);
     expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  /**
+   * The shape that actually reaches a settings box. A held-down asterisk key or a
+   * pasted separator line produces this, and before the star-run collapse thirteen
+   * asterisks took 27 seconds for one ordinary vault path while eighteen never
+   * returned. Budget is generous on purpose: this pins the exponent, not the machine.
+   */
+  it("does not backtrack catastrophically on a run of plain asterisks", () => {
+    const realisticPath =
+      "LifeSystem/Projects/2026/Q3/meetings/platform/migration/round2/drafts/notes-final.md";
+    for (const stars of [7, 13, 18, 30]) {
+      const m = compileExcludes(["*".repeat(stars) + ".png"]);
+      const started = performance.now();
+      expect(m.isExcluded(realisticPath)).toBe(false);
+      expect(performance.now() - started).toBeLessThan(250);
+    }
+  });
+
+  it("treats three or more asterisks as **, which is what they already meant", () => {
+    const two = compileExcludes(["**"]);
+    for (const stars of [3, 5, 12]) {
+      const many = compileExcludes(["*".repeat(stars)]);
+      for (const p of ["a.md", "sub/a.md", "sub/deep/a.png"]) {
+        expect(many.isExcluded(p)).toBe(two.isExcluded(p));
+      }
+    }
+  });
+});
+
+describe("matchesEverything", () => {
+  // One stray character in the exclude box would otherwise silence the whole sync,
+  // reporting success over an empty change set.
+  it("flags patterns that would exclude the entire vault", () => {
+    for (const p of ["*", "**", "*/", "**/", "***", "****************"]) {
+      expect(matchesEverything(p)).toBe(true);
+    }
+  });
+
+  it("does not flag ordinary patterns, including the shipped defaults", () => {
+    for (const p of [".obsidian", ".obsidian/", ".git/", ".trash/", "*.png", "**/*.png", "notes"]) {
+      expect(matchesEverything(p)).toBe(false);
+    }
+    for (const p of DEFAULT_EXCLUDES) expect(matchesEverything(p)).toBe(false);
   });
 });

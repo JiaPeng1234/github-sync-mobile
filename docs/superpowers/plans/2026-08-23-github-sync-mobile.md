@@ -706,7 +706,9 @@ exact and it must work in both directions.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `tests/git/exclude.test.ts`:
+Create `tests/git/exclude.test.ts`. The final file has **24 tests** — the 12 below plus twelve
+added while implementing, covering the bare-directory form, zero-depth `**`, both backtracking
+collapses, and `matchesEverything`. Copy the committed file rather than only the block below:
 
 ```ts
 import { describe, it, expect } from "vitest";
@@ -836,16 +838,29 @@ function toRegExp(rawPattern: string): RegExp {
   else if (p.endsWith("/*")) p = p.slice(0, -2);
   else if (p.endsWith("/")) p = p.slice(0, -1);
 
-  // Collapse runs of `**/` into one.
+  // Collapse redundant asterisk runs before translating them.
   //
-  // Each becomes an independent `(?:.*/)?`, and several in a row make the regex
-  // backtrack exponentially in the depth of the path being tested. Measured before
-  // this collapse: a pattern with twelve `**/` groups took 4.1 seconds for a single
-  // path at depth 30, and filtering 2000 paths took 18 seconds — an unresponsive
-  // phone, with no timeout anywhere and no way for the user to see why. Collapsing
-  // is also semantically harmless, since consecutive "any number of directories"
-  // groups say nothing more than one of them.
-  p = p.replace(/(?:\*\*\/)+/g, "**/");
+  // Both collapses exist to stop the compiled regex backtracking exponentially in the
+  // length of the path being tested. There is no timeout anywhere in the sync path, so
+  // a slow pattern is not a stutter — it is a wedged app on a device where the user
+  // can inspect nothing.
+  //
+  // Measured before these collapses, one `isExcluded` call:
+  //   `**/` x12 against a depth-30 path      10.3 s
+  //   `*` x13 + ".png" against an ordinary
+  //   84-character vault path                27.1 s
+  //   `*` x18 + "z.md"                       did not return in four minutes
+  //
+  // The `*` case is the one that matters in practice. `**/` x12 is not something a
+  // person types; a held-down asterisk key, or a pasted `****************` separator,
+  // is. `*` is also the wildcard users reach for, because the predecessor plugin
+  // supported only `*`.
+  //
+  // Both rewrites are semantically free. Three or more asterisks in a row are exactly
+  // `**`, because `.*` already subsumes the `[^/]*` that an odd trailing star would
+  // add; and consecutive "any number of directories" groups say nothing more than one
+  // of them does.
+  p = p.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
 
   const body = p
     .replace(/[.+^${}()|[\]\\?]/g, "\\$&")
@@ -865,6 +880,31 @@ function toRegExp(rawPattern: string): RegExp {
   // publishing the plugin's own settings file, and with it the GitHub token. It also
   // matches how .gitignore treats a pattern that names a directory.
   return new RegExp(`^${body}(?:/.*)?$`);
+}
+
+/**
+ * True when a single pattern would exclude the whole vault.
+ *
+ * `*` excludes everything, because it matches a directory segment and every pattern
+ * also matches what lies beneath whatever it matched. That is the same rule .gitignore
+ * uses, and it is what makes a bare `.obsidian` protect the token file — but it means
+ * one stray character in the exclude box silences the entire sync: nothing is staged,
+ * nothing is pushed, and the sync still reports success over an empty change set.
+ * Silent backup loss, on the platform where the user can inspect nothing.
+ *
+ * Decided empirically rather than by inspecting the pattern, so no amount of creative
+ * asterisk arrangement can slip past a structural check.
+ */
+export function matchesEverything(pattern: string): boolean {
+  const probes = [
+    "a.md",
+    "sub/a.md",
+    "sub/deep/a.md",
+    ".obsidian/app.json",
+    "Attachments/img.png",
+  ];
+  const m = compileExcludes([pattern]);
+  return probes.every((probe) => m.isExcluded(probe));
 }
 
 export function compileExcludes(patterns: readonly string[]): ExcludeMatcher {
@@ -889,8 +929,9 @@ export function compileExcludes(patterns: readonly string[]): ExcludeMatcher {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/exclude.test.ts`
-Expected: PASS, 18 tests. The bare-directory case and the backtracking guard are the ones that
-matter — the first closes a token-leak footgun, the second an unresponsive phone.
+Expected: PASS, 24 tests. Four matter most: the bare-directory case closes a token-leak footgun,
+the two backtracking guards close a wedged app, and `matchesEverything` is what stops one stray
+character silencing the whole sync.
 
 - [ ] **Step 5: Commit**
 
@@ -3418,6 +3459,11 @@ Add these methods to the class:
 
     if (!opts.remoteHasContent) return { kind: "init-push" };
 
+    // Note the interaction with the exclude set: `hasLocalContent()` asks whether any
+    // NON-excluded file exists, so an exclude pattern that matches everything makes any
+    // vault look empty and sends this decision down the clone-safe path. Task 16 warns
+    // about such a pattern at the point of entry; nothing here can distinguish "empty
+    // vault" from "everything excluded", which is why that warning matters.
     if (await this.hasLocalContent()) {
       return {
         kind: "refuse",
@@ -4240,6 +4286,7 @@ Note the explicit token-leak warning when un-excluding `.obsidian/` — the toke
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type GitHubSyncPlugin from "../main";
 import { DEFAULT_EXCLUDES, TIMESTAMP_TOKEN } from "../constants";
+import { matchesEverything } from "../git/exclude";
 import { GitHubApi } from "../github/api";
 
 export class SettingsTab extends PluginSettingTab {
@@ -4355,6 +4402,22 @@ export class SettingsTab extends PluginSettingTab {
           this.display();
         }),
       );
+
+    // A pattern that matches everything silences the entire sync: nothing is staged,
+    // nothing is pushed, and the sync still reports success over an empty change set.
+    // `*` does this, because every pattern also matches what lies beneath what it
+    // matched. On iOS the user cannot inspect anything, so it has to be caught here.
+    const offending = this.plugin.settings.excludePatterns.filter(matchesEverything);
+    if (offending.length > 0) {
+      const warning = containerEl.createEl("p", {
+        text:
+          `Warning: the pattern ${offending.map((p) => `"${p}"`).join(", ")} excludes ` +
+          `every file in this vault, so nothing will be synced. Remove it or make it ` +
+          `more specific.`,
+      });
+      warning.style.color = "var(--text-error)";
+      warning.style.fontWeight = "600";
+    }
 
     new Setting(containerEl)
       .setName("Excluded paths (advanced)")

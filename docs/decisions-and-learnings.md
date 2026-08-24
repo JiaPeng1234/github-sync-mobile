@@ -273,19 +273,53 @@ the dependency.** This one was repeated across five places and was wrong in all 
 
 ### A user-editable regex is an attack surface on your own phone
 
-The exclude patterns compile to regexes, and `**` became `.*`. Each `**/` group became an
-independent `(?:.*/)?`, so several in a row backtracked exponentially in the *depth of the path
-being tested* — not in pattern length. Measured before the fix: twelve `**/` groups took 4.1
-seconds for one path at depth 30, and filtering 2000 paths took **18 seconds**. There is no
-timeout anywhere in the sync path, so that is a frozen phone with nothing to explain itself.
-The shipped defaults were never affected (20,000 paths in 6 ms); only hand-written patterns.
+Exclude patterns compile to regexes, and asterisk runs become `.*`. Adjacent `.*` groups
+backtrack exponentially in the length of the path being tested. There is no timeout anywhere in
+the sync path, so this is not a stutter — it is a wedged app on the one platform where the user
+can inspect nothing.
 
-Fixed by collapsing runs of `**/` into one, which is semantically free — consecutive "any number
-of directories" groups say nothing more than one of them does.
+Measured, one `isExcluded` call:
 
-Worth noting the shape that is dangerous is not the obvious one. `**a**a**a**a**` completes in
-0.03 ms because it matches immediately. The expensive case is many `**/` groups against a deep
-path that does *not* match.
+| pattern | against | before |
+|---|---|---|
+| `**/` × 12 | depth-30 path | 10.3 s |
+| `*` × 13 + `.png` | ordinary 84-char vault path | 27.1 s |
+| `*` × 18 + `z.md` | same | did not return in four minutes |
+
+**The first round of this fix only collapsed `**/` runs, and that was the wrong half.** `**/`×12
+is not something a person types. A held-down asterisk key, or a pasted `****************`
+separator line, is — and `*` is the wildcard users reach for, because the predecessor plugin
+supported only `*`. Review caught that the likelier and far cheaper trigger was still fully open
+after the first fix, with post-fix timings identical to pre-fix.
+
+Both are now collapsed: three or more asterisks in a row become `**`, and runs of `**/` become
+one `**/`. Both rewrites are semantically free — `.*` already subsumes the `[^/]*` an odd
+trailing star would add, and consecutive "any number of directories" groups say nothing more than
+one of them. The shipped defaults were never affected (3000 deep paths in ~2 ms).
+
+Two things worth carrying forward. **The dangerous shape is not the obvious one:**
+`**a**a**a**a**` returns in 0.03 ms — but only because it *matches*; non-matching input is where
+it blows up. And **collapsing cannot close the class**, only its reachable instances: shapes like
+`**/*/` repeated are still exponential, merely harmless at realistic vault depths. A length or
+complexity bound at the settings layer would be the real fix if this ever bites again.
+
+### One stray character can silence the whole sync
+
+The universal directory-suffix fix below closed a token leak, but it broadened every pattern, and
+review found the mirror-image hazard: bare `*` now matches every path in the vault. Nothing is
+staged, nothing is pushed, and the sync still **reports success** over an empty change set. That
+is silent backup loss, arrived at by deleting one character from `.obsidian/*`.
+
+The semantics are correct — .gitignore behaves the same way, and it is the same rule that makes a
+bare `.obsidian` protect the token file — so the guard belongs at the point of entry rather than
+in the matcher. `matchesEverything()` decides it empirically, by probing representative paths
+rather than inspecting the pattern, so no creative arrangement of asterisks slips past. The
+settings tab refuses to stay quiet about a pattern that trips it.
+
+It also interacts with safety invariant 5: "local is empty" means "no non-excluded file exists",
+so an exclude-everything pattern makes *any* vault look empty and steers the connect decision down
+the clone-safe path. Nothing at that layer can tell "empty vault" from "everything excluded",
+which is why the settings-layer warning is load-bearing rather than cosmetic.
 
 ### A dropped slash was a token leak
 
@@ -297,6 +331,14 @@ matched, which is what .gitignore does for a pattern naming a directory.
 
 The same rework made `**/` match zero directories as well as many, so `**/*.png` now covers a
 root-level `a.png` — what a user writing that pattern means.
+
+### Two deliberate gaps against .gitignore
+
+`?` is a literal, not a single-character wildcard, and bracket classes are literal too — so
+`note?.md` does not match `note1.md`, and `f[0-9].md` does not match `f1.md`. Both divergences are
+in the *under*-match direction, meaning files stay pushed, which is the safe way to be wrong. Worth
+knowing before someone "fixes" them, since adding character classes would also add new
+backtracking shapes.
 
 ### The sentinel that must not be printable
 

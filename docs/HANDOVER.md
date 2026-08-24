@@ -47,7 +47,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 1 Project scaffolding | ✅ implemented, spec review passed, quality review approved |
 | 2 Test harness | ✅ implemented, spec review passed, quality review approved |
 | 3 Types and constants | ✅ implemented, spec review passed, quality review approved after 4 rounds |
-| 4 Exclude engine | ✅ implemented, reviews pending |
+| 4 Exclude engine | ✅ implemented, spec review passed |
 | 5 Filesystem bridge | ⬜ plan revised — ENOENT/ENOTDIR/EISDIR, `VaultAdapter` type |
 | 6 HTTP client | ⬜ plan revised — the two `requestUrl` rules |
 | 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 50 passed
+npx vitest run       # expect 54 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -215,22 +215,21 @@ Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-an
 
 ## 6. What to do next
 
-Task 4, the exclude engine. It is small, pure, and heavily tested — a good re-entry point.
+Task 5, the filesystem bridge. It adapts Obsidian's `DataAdapter` to the `fs.promises` shape
+isomorphic-git expects, and it is where several load-bearing constraints land at once.
 
 ```
-Plan section: "## Task 4: Exclude engine"
-Creates:      src/git/exclude.ts
-Tests:        tests/git/exclude.test.ts   (12 cases)
+Plan section: "## Task 5: Filesystem adapter"
+Creates:      src/git/fs-adapter.ts
+Tests:        tests/git/fs-adapter.test.ts
 ```
 
-Two details already settled in the plan, so do not re-litigate them: `compileExcludes` takes
-`readonly string[]` (because `DEFAULT_EXCLUDES` is readonly — it is the token-leak guard and must
-not be aliased and mutated), and a trailing `/`, `/*`, or `/**` all mean "the directory and
-everything under it" (the predecessor supported only `*`, so users wrote `.obsidian/*` and it
-silently failed to match nested paths).
-
-Then Tasks 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18 → 19 in order. The plan
-notes dependencies where they exist.
+Read the constraint list at the top of that plan section before writing anything. In particular:
+`rel()` must map both the vault base and git's `"."` to `""`; `readFile` must handle the encoding
+argument in both its object and bare-string forms; never return a native `Buffer`; hand
+`writeBinary` an exact-size `ArrayBuffer`; do not silently create parent directories on write; keep
+`ENOENT`, `ENOTDIR`, and `EISDIR` distinct; and expose the `readFailures` channel, because
+isomorphic-git reports a failed directory read as an empty directory and something has to notice.
 
 ### Deferred by decision, not oversight
 
