@@ -2620,7 +2620,7 @@ Add these methods inside the `SafeGit` class:
       const { oid: blobOid } = await git.readBlob({ ...this.base(), oid, filepath });
       return blobOid;
     } catch (err) {
-      if (isPathAbsent(err)) return null;
+      if (isPathAbsent(err, oid)) return null;
       throw new Error(`Cannot read ${filepath} at ${oid.slice(0, 7)}: ${message(err)}`);
     }
   }
@@ -2642,7 +2642,7 @@ Add these methods inside the `SafeGit` class:
       const { blob } = await git.readBlob({ ...this.base(), oid, filepath });
       bytes = blob;
     } catch (err) {
-      if (isPathAbsent(err)) return { state: "absent" };
+      if (isPathAbsent(err, oid)) return { state: "absent" };
       return { state: "unreadable", error: message(err) };
     }
     try {
@@ -2678,9 +2678,14 @@ Add these module-private helpers at the bottom of the file, outside the class:
  */
 const OID = /^[0-9a-f]{40}$/;
 
-function isPathAbsent(err: unknown): boolean {
+function isPathAbsent(err: unknown, oid: string): boolean {
   const e = err as { code?: string; data?: { what?: string } };
   if (e?.code !== "NotFoundError") return false;
+  // Only trustworthy for a full oid. An abbreviated oid or a ref name such as
+  // "main" is not expanded before the object read, so it reports itself in
+  // `data.what` and would look like a missing path. Answering false in that case
+  // routes to `unreadable`, which refuses rather than deletes.
+  if (!OID.test(oid)) return false;
   return !OID.test(e.data?.what ?? "");
 }
 
