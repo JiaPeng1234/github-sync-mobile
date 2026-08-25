@@ -14,7 +14,6 @@ export type VaultAdapter = Pick<
   | "readBinary"
   | "write"
   | "writeBinary"
-  | "exists"
   | "stat"
   | "list"
   | "mkdir"
@@ -133,9 +132,9 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
   const rel = (abs: string): string => {
     // Deliberately does NOT rewrite backslashes. They are legal characters in an
     // iOS/macOS filename, and git never sends them as separators — only a Windows
-    // `basePath` needs that, which `normBase` above already handles. Rewriting here made
-    // a vault containing `a\b.md` unsyncable: `statusMatrix` threw ENOENT naming a path
-    // the user does not have, and if a real `a/b.md` also existed the failure was silent,
+    // `basePath` needs that, which `normBase` above already handles. Rewriting here makes
+    // a vault containing `a\b.md` unsyncable: `statusMatrix` throws ENOENT naming a path
+    // the user does not have, and if a real `a/b.md` also exists the failure is silent,
     // with `a\b.md` never staged and nothing recorded.
     let p = abs;
     if (normBase) {
@@ -206,9 +205,9 @@ export function createFs(adapter: VaultAdapter, base: string): VaultFs {
       // right code is necessary but not sufficient: nothing downstream can see it,
       // which is why `readFailures` exists.
       //
-      // Both the stat and the listing are wrapped. An earlier version guarded only
-      // the listing, leaving a transient stat failure to be swallowed as `[]` with
-      // nothing recorded — silent, which is the one outcome this project never accepts.
+      // Both the stat and the listing must be wrapped. Guarding only the listing leaves
+      // a transient stat failure to be swallowed as `[]` with nothing recorded — silent,
+      // which is the one outcome this project never accepts.
       const st = await recordRead(p, () => adapter.stat(p));
 
       if (p !== "") {

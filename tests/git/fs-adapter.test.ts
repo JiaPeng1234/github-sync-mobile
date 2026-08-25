@@ -240,6 +240,53 @@ describe("fs-adapter", () => {
     expect(bridge.readFailures).toContain("notes");
   });
 
+  /**
+   * Pins the text content-read guard specifically. `failReadsAt` fails `stat` first, and
+   * `stat` runs before the content read, so no existing test can tell the two guards
+   * apart — deleting the `recordRead` wrap around `adapter.read` left the suite green.
+   * Verified against real isomorphic-git: a content read of `.git/index` that fails while
+   * its stat succeeds does NOT throw in statusMatrix; it silently empties the stage, so
+   * only this recording catches it.
+   */
+  it("records a failed text content read even when stat succeeds", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.write("a.md", "x");
+    const failing = new Error("EIO: injected") as Error & { code: string };
+    failing.code = "EIO";
+    adapter.read = async () => {
+      throw failing;
+    };
+
+    await expect(fs.readFile("a.md", "utf8")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("a.md");
+  });
+
+  /** Pins the binary content-read guard specifically, same technique as the text case. */
+  it("records a failed binary content read even when stat succeeds", async () => {
+    const { adapter, fs, bridge } = setup();
+    await adapter.writeBinary("a.bin", new Uint8Array([1, 2, 3]).buffer);
+    const failing = new Error("EIO: injected") as Error & { code: string };
+    failing.code = "EIO";
+    adapter.readBinary = async () => {
+      throw failing;
+    };
+
+    await expect(fs.readFile("a.bin")).rejects.toMatchObject({ code: "EIO" });
+    expect(bridge.readFailures).toContain("a.bin");
+  });
+
+  /**
+   * Pins the `st.type !== "file"` guard in readFile. The stat succeeds and returns a
+   * directory, so the guard must throw ENOENT before any content read runs — and because
+   * the stat itself succeeded, nothing is a read failure and nothing is recorded.
+   */
+  it("throws ENOENT from readFile on a directory and records nothing", async () => {
+    const { fs, bridge } = setup();
+    await fs.mkdir("dir");
+    await expect(fs.readFile("dir", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(bridge.readFailures).toEqual([]);
+  });
+
   it("does not hand out the live read-failure array", async () => {
     const { adapter, fs, bridge } = setup();
     await adapter.write("a.md", "x");
