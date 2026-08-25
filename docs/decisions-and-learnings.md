@@ -513,6 +513,32 @@ class of engine bug that was in fact still live; once it described a merge drive
 considered and rejected. Both were corrected. A spec asserting a safety property that does not exist
 is actively harmful — it stops the next reader from looking.
 
+### The read-failure guard has to cover both scan paths, not one
+
+`scanWorkingTree` (behind `status`/`commitLocal`) clears and checks the bridge's `readFailures`
+channel and refuses a scan it cannot trust. But `hasLocalContent` walked its *own* recursion with
+swallowing catches and never consulted the channel. A transient read failure over a vault that holds
+real notes therefore made it return `false` — "empty" — and `decideConnect` (Task 11) keys the
+clone-safe-vs-refuse decision on exactly that boolean. The result: a momentary iOS read stall could
+flip a *refuse* into *clone the remote over your vault*. `checkout({force:false})` blocks the worst
+overlapping-file clobber, but relying on that alone is the "your error handling is a decoration"
+anti-pattern this project keeps re-learning. Fix: `hasLocalContent` now clears and checks
+`readFailures` and throws the same refusal, and Task 11 must let the throw propagate. The lesson is
+that a safety guard on one code path does not protect a second path that reaches the same decision by
+different code.
+
+### A guard's test must take the route the guard defends
+
+Both the `readFailures` refusal and the `stillOnDisk` deletion check passed a green suite yet
+*survived mutation* — deleting either left every test passing. The single test aimed at them injected
+a read failure on a **subdirectory**, where isomorphic-git's tree walker `lstat`s the folder first,
+throws, and trips a *different* guard (the `statusMatrix` try/catch). The guards' actual job is the
+**root** read failure, where `statusMatrix` *returns* a phantom-deletion row instead of throwing —
+the route the tests never took. And `stillOnDisk` cannot be pinned by any `failReadsAt` injection at
+all, because the bridge records every such failure and `scanWorkingTree`'s guard fires first; it can
+only be reached by a `list`-omits-file / `stat`-still-finds-file shape that records nothing. A test
+that reaches a guard by a convenient route proves nothing about the route that loses data.
+
 ---
 
 ## Part 4 — Process notes

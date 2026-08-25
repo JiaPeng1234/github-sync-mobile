@@ -1789,6 +1789,25 @@ This task builds the read-only surface, including the **phantom-deletion suppres
 prevents excluded-but-remote-tracked files from being reported as deletions and pushed as
 removals.
 
+> **Implementation notes (shipped 2026-08-25 — `src/git/safe-git.ts` is the source of truth):**
+> - **Implemented together with Task 8.** This section's test file calls `commitLocal` (Task 8)
+>   and `stillOnDisk` references `join`, so the two tasks cannot pass independently. They were
+>   built and reviewed as one unit.
+> - **Two gaps in the code below were filled as authorized:** a private `join(filepath)` that
+>   returns `filepath` when `dir === ""` (mobile) else `` `${dir}/${filepath}` ``, and a top-level
+>   `message(err)` helper used by `scanWorkingTree`'s catch. Both are in the shipped file.
+> - **`hasLocalContent` refuses on a read failure.** The code below walked its own recursion with
+>   swallowing catches and ignored the `readFailures` channel, so a transient read over a vault
+>   *with* notes returned `false` — which would send Task 11's `decideConnect` down the clone-safe
+>   path and write the remote over real notes. The shipped version clears `readFailures` before the
+>   walk and throws the standard refusal if any landed, exactly like `scanWorkingTree`. Task 11 must
+>   let that throw propagate.
+> - **Guard tests use the ROOT read-failure route.** A subdir read failure makes `statusMatrix`
+>   *throw* (caught by the other guard); only a root failure makes it *return* a phantom-deletion
+>   row, which is the route the `readFailures` and `stillOnDisk` guards actually defend. Tests pin
+>   both via root injection; `stillOnDisk` is additionally pinned by a `list`-omits-file /
+>   `stat`-finds-file shape that records nothing, the only way a phantom row reaches the commit loop.
+
 **Files:**
 - Create: `src/git/safe-git.ts`
 - Test: `tests/git/safe-git-status.test.ts`, `tests/helpers/repo.ts`
@@ -2298,6 +2317,11 @@ git commit -m "feat: SafeGit repo state and status with phantom-deletion suppres
 
 Invariant 2: local work becomes a real commit **before** any merge. This is what makes
 isomorphic-git issue #1046 (pull silently discarding uncommitted edits) unreachable.
+
+> **Implementation notes (shipped 2026-08-25 with Task 7 — `src/git/safe-git.ts` is the source of
+> truth):** `commitLocal` is as shown below. The `stillOnDisk` belt-and-braces deletion check is
+> load-bearing and mutation-pinned; see Task 7's implementation notes for how it and the
+> `readFailures` refusal are tested via the root-read-failure route.
 
 **Files:**
 - Modify: `src/git/safe-git.ts`
@@ -3528,6 +3552,13 @@ git commit -m "feat: whole-file conflict resolution with real merge commits"
 ---
 
 ## Task 11: SafeGit — connect decision, clone-safe, fetch, push
+
+> **Carried from the Task 7 review (2026-08-25):** `hasLocalContent()` now **throws** on a read
+> failure rather than returning `false` (a transient read over a vault with notes must not be
+> misread as "empty" and sent down clone-safe). `decideConnect` calls `if (await
+> this.hasLocalContent())` — let that throw propagate to the connect UI as a refuse-and-explain.
+> Do **not** wrap it in a try/catch that treats a failure as "no local content"; that would
+> reopen the exact data-loss hole the review closed.
 
 **Files:**
 - Modify: `src/git/safe-git.ts`

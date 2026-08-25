@@ -50,8 +50,8 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 4 Exclude engine | ✅ implemented, both reviews passed |
 | 5 Filesystem bridge | ✅ implemented, both reviews passed — quality review closed a coverage gap on the two content-read guards |
 | 6 HTTP client | ✅ implemented, both reviews passed — real git http-backend + iso-git 1.41.8 clone confirmed the array response body works on the real route |
-| 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
-| 8 SafeGit: commit | ⬜ |
+| 7 SafeGit: state + status | ✅ implemented + reviewed **with Task 8** — see note below |
+| 8 SafeGit: commit | ✅ implemented + reviewed **with Task 7** — Task 7's tests call `commitLocal`, so they ship together |
 | 9 **SafeGit: safe merge** | ⬜ heavily revised — binary pre-screen, `threeWayOids`, `isPathAbsent` |
 | 10 **SafeGit: conflict resolution** | ⬜ heavily revised — byte-safe `materialise`, atomic screening |
 | 11 SafeGit: connect/clone/fetch/push | ⬜ |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 101 passed
+npx vitest run       # expect 126 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -248,19 +248,28 @@ stop an unreadable `.git/index` from shipping an empty-tree commit) were unteste
 succeeds, each verified by mutation. Also dropped the unused `"exists"` from `VaultAdapter` and
 reframed two changelog comments as invariants. 93 tests.
 
-**Task 6 is done** (both reviews passed; the two `requestUrl` rules are in the code and pinned by
-tests). Response headers are now lowercased in the bridge and the request-body exact-size copy is
-mutation-pinned.
+**Tasks 5–8 are done**, all fully reviewed. `src/git/safe-git.ts` now exists — the only module
+allowed to import isomorphic-git — with `isRepo`, `hasLocalContent`, `status`, and `commitLocal`.
 
-**Start with Task 7, SafeGit: construction, repo state, and status.** The first piece of the safety
-core.
+Two things the 7+8 round settled that the next session should carry:
 
-```
-Plan section: "## Task 7: SafeGit — construction, repo state, and status"
-Creates:      src/git/safe-git.ts (the ONLY module allowed to import isomorphic-git)
-```
+- **Tasks 7 and 8 were implemented together.** Task 7's test file calls `commitLocal` (a Task 8
+  method) and its `stillOnDisk` referenced an undefined `join`, so Task 7 could not pass alone.
+  They ship as one unit. The plan's Task 7/8 sections have been synced from the real files.
+- **The read-failure guard lives on TWO paths, not one.** `scanWorkingTree` (status/commitLocal)
+  clears and checks `readFailures`. Review found `hasLocalContent` had its own swallowing recursion
+  and ignored the channel — a transient read over a vault *with* notes returned `false`, which would
+  send Task 11's `decideConnect` down the clone-safe path and write the remote over real notes.
+  `hasLocalContent` now refuses on a recorded failure too. **When you write Task 11, rely on that
+  throw propagating** — `decideConnect` must not swallow it.
 
-**Then Tasks 8 → 9 → 10 → 11 in order.** These are the safety core and the hardest work in the
+**Start with Task 9, SafeGit: safe merge.** This is the hardest and most safety-critical task in the
+whole plan — binary pre-screen, `threeWayOids`, commit-before-merge (Invariant 2), and the
+`unmergeable` outcomes (multiple merge bases / unrelated histories). Do not shortcut it; give it the
+full drill (spec + quality review, mutation, real-git probes of every guard, and an empirical check
+that iso-git's own merge does the lossy binary round-trip the pre-screen exists to prevent).
+
+**Then Tasks 10 → 11 in order.** These are the safety core and the hardest work in the
 plan. Task 7 carries two obligations inherited from Task 5, both already written into its plan
 section: treat a *thrown* `statusMatrix` as a refusal, not only a recorded failure; and confirm every
 claimed deletion against the working tree before staging it.
