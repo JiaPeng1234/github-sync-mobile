@@ -184,6 +184,92 @@ describe("SafeGit.resolveConflicts", () => {
     ).rejects.toThrow(/no pending conflict/i);
   });
 
+  /**
+   * FINDING 2, layer (b). A conflict is recorded, then the user commits a precious v2
+   * on top and a later mergeSafe fast-forwards past it. If resolveConflicts trusted the
+   * now-stale `pending` it would overwrite v2 on disk with R1's old content and commit
+   * with stale parents [L1,R1] -- so v2 is not even reachable in history. Destroyed.
+   *
+   * resolveConflicts must VALIDATE pending against current reality before acting: if
+   * pending.ourHead !== current local OR pending.theirHead !== current remote, it refuses
+   * and writes nothing.
+   *
+   * Mutation-verification: with layer (b) removed, this test FAILS -- v2 is overwritten
+   * on disk with "remote v1\n" and HEAD moves to a bogus merge commit.
+   */
+  it("refuses to apply a stale conflict after an intervening fast-forward", async () => {
+    const h = await makeHarness();
+    const base = await initRepo(h);
+
+    // Step 1: produce a real conflict on notes/a.md. local L1 vs remote R1.
+    await h.write("notes/a.md", "local v1\n");
+    const L1 = await h.commit(["notes/a.md"], "local v1");
+    const R1 = await divergeRemote(h, base, { "notes/a.md": "remote v1\n" }, "remote v1");
+
+    const out = await h.safeGit.mergeSafe();
+    if (out.kind !== "conflict") throw new Error("expected a conflict");
+
+    // Step 2: user edits a.md to precious v2 and commits on top of L1 -> L2.
+    await h.write("notes/a.md", "PRECIOUS V2\n");
+    const L2 = await h.commit(["notes/a.md"], "local v2 (precious)");
+
+    // A later fetch fast-forwards: the remote now points at a descendant of L2.
+    await h.write("notes/a.md", "remote v3\n");
+    const R2 = await h.commit(["notes/a.md"], "remote v3 on top of L2");
+    // Restore local HEAD to L2; origin now points at R2 (a descendant of L2).
+    await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: L2, force: true });
+    await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
+    await setOriginRef(h, R2);
+    // Put v2 back on disk (the checkout above moved the working tree to L2's a.md).
+    await h.adapter.write("notes/a.md", "PRECIOUS V2\n");
+
+    // The stale pending still says {ourHead:L1, theirHead:R1}. Resolution must refuse
+    // because neither matches current reality (local L2, remote R2).
+    await expect(
+      h.safeGit.resolveConflicts([{ path: "notes/a.md", choice: "theirs" }]),
+    ).rejects.toThrow(/nothing was changed/i);
+
+    // v2 is still on disk and HEAD is still L2 -- nothing was destroyed.
+    expect(await h.adapter.read("notes/a.md")).toBe("PRECIOUS V2\n");
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(L2);
+    void R1;
+  });
+
+  /**
+   * FINDING 2, layer (a). mergeSafe must clear `pending` on its non-conflict exits. A
+   * conflict is recorded, then the situation resolves to a fast-forward/up-to-date on a
+   * second mergeSafe. A subsequent resolveConflicts must report there is no pending
+   * conflict (proving mergeSafe cleared it), rather than acting on the stale record.
+   */
+  it("clears pending on a fast-forward so a later resolve reports no pending conflict", async () => {
+    const h = await makeHarness();
+    const base = await initRepo(h);
+
+    // Produce a conflict: local edit vs remote edit of the same file.
+    await h.write("notes/a.md", "local v1\n");
+    const L1 = await h.commit(["notes/a.md"], "local v1");
+    await divergeRemote(h, base, { "notes/a.md": "remote v1\n" }, "remote v1");
+
+    const out = await h.safeGit.mergeSafe();
+    if (out.kind !== "conflict") throw new Error("expected a conflict");
+
+    // Now force the second mergeSafe to be a pure fast-forward: rewind local to `base`
+    // (an ancestor of a remote lineage) so mergeSafe fast-forwards instead of conflicting.
+    const ffRemote = await divergeRemote(h, base, { "notes/ff.md": "ff\n" }, "remote ff work");
+    await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: base, force: true });
+    await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
+    await setOriginRef(h, ffRemote);
+
+    const second = await h.safeGit.mergeSafe();
+    expect(second.kind).toBe("fast-forward");
+
+    // pending was cleared by the fast-forward, so resolution has nothing to act on.
+    await expect(
+      h.safeGit.resolveConflicts([{ path: "notes/a.md", choice: "theirs" }]),
+    ).rejects.toThrow(/no pending conflict/i);
+    void L1;
+  });
+
   it("throws when a resolution is missing for a conflicting path", async () => {
     const h = await makeHarness();
     await conflicted(h);

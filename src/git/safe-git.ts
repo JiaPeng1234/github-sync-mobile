@@ -257,11 +257,27 @@ export class SafeGit {
     const matrix = await this.scanWorkingTree();
 
     let staged = 0;
-    for (const [filepath, head, workdir] of matrix) {
+    for (const [filepath, head, workdir, stage] of matrix) {
       if (this.exclude.isExcluded(filepath)) continue;
       if (head === 1 && workdir === 1) continue;
 
       if (workdir === 0) {
+        // A `head === 1, workdir === 0, stage === 0` row is NOT a user deletion — it is an
+        // interrupted checkout. If the app was killed after a fast-forward/merge advanced the
+        // branch ref but before the working tree was materialised, HEAD tracks the file, the
+        // index never received it (stage === 0), and it is absent from disk. Committing this as
+        // a removal would push away a file that still exists on the remote — the very thing this
+        // plugin must never do. A genuine deletion of a checked-out file is `[1,0,1]`: the index
+        // still holds it. Only stage === 1 confirms the file was materialised and then removed.
+        // Verified against real isomorphic-git 1.41: interrupted ff → [1,0,0]; real delete → [1,0,1].
+        if (head === 1 && stage === 0) {
+          throw new Error(
+            `${filepath} is in the committed history but was never written to this device ` +
+              `(an earlier sync was interrupted before it finished). Refusing to commit its ` +
+              `removal, which would delete it from the remote. Nothing was changed — re-run sync.`,
+          );
+        }
+
         // Belt and braces on top of scanWorkingTree's guard: confirm the file really is
         // gone before staging its removal. A `workdir === 0` that came from a swallowed
         // directory-read failure would otherwise commit a deletion of a file that exists.
@@ -362,10 +378,15 @@ export class SafeGit {
     const remote = await this.tryResolve(`refs/remotes/origin/${this.branch}`);
 
     if (!remote || !local) {
+      // Any successful or no-op merge supersedes an outstanding conflict: the state it
+      // was recorded against no longer exists.
+      this.pending = null;
       this.log("merge: no remote ref yet, nothing to merge");
       return { kind: "up-to-date" };
     }
     if (local === remote) {
+      // Any successful or no-op merge supersedes an outstanding conflict.
+      this.pending = null;
       this.log("merge: already up to date");
       return { kind: "up-to-date" };
     }
@@ -388,6 +409,8 @@ export class SafeGit {
 
     if (bases[0] === local) {
       const oid = await this.fastForwardTo(remote);
+      // Any successful or no-op merge supersedes an outstanding conflict.
+      this.pending = null;
       return { kind: "fast-forward", oid };
     }
 
@@ -459,6 +482,8 @@ export class SafeGit {
     });
     const merged = result.oid ?? (await git.resolveRef({ ...this.base(), ref: "HEAD" }));
     await this.checkoutTracked(merged);
+    // Any successful or no-op merge supersedes an outstanding conflict.
+    this.pending = null;
     this.log(`merge: merged as ${merged.slice(0, 7)}`);
     return { kind: "merged", oid: merged };
   }
@@ -670,6 +695,23 @@ export class SafeGit {
   async resolveConflicts(resolutions: ConflictResolution[]): Promise<string> {
     const pending = this.pending;
     if (!pending) throw new Error("no pending conflict to resolve");
+
+    // Belt-and-braces on top of mergeSafe clearing pending on its non-conflict exits:
+    // validate the pending conflict against current reality before acting on it. If the
+    // local or remote head has moved since the conflict was recorded (e.g. the user
+    // committed on top and a later fetch fast-forwarded past it), the pending record is
+    // stale. Trusting it would overwrite the newer content on disk and commit with stale
+    // parents, so the newer content would not even be reachable in history. Refuse and
+    // write nothing rather than apply a resolution against a state that no longer exists.
+    const currentLocal = await this.tryResolve(`refs/heads/${this.branch}`);
+    const currentRemote = await this.tryResolve(`refs/remotes/origin/${this.branch}`);
+    if (pending.ourHead !== currentLocal || pending.theirHead !== currentRemote) {
+      throw new Error(
+        `The repository moved since this conflict was recorded, so the pending ` +
+          `resolution no longer applies. Nothing was changed — re-run sync to get a ` +
+          `fresh conflict.`,
+      );
+    }
 
     const byPath = new Map(resolutions.map((r) => [r.path, r.choice]));
 

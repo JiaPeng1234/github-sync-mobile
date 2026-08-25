@@ -363,4 +363,51 @@ describe("SafeGit idempotency", () => {
 
     expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(firstOid);
   });
+
+  /**
+   * Invariant 8, at the sequence level. If iOS kills the app after a fast-forward advanced
+   * the branch ref but before the working tree was materialised, HEAD tracks a remote-added
+   * file that was never written to disk. On the next sync, commitLocal must NOT read that as
+   * a user deletion and commit its removal — doing so would push the file's deletion and
+   * destroy it on the remote. The state is `[head=1, workdir=0, stage=0]`; a genuine deletion
+   * is `[1,0,1]` (the index still holds it). Reproduced by driving the real mergeSafe
+   * fast-forward and killing the adapter write of the incoming file.
+   */
+  it("refuses to commit a deletion for a remote-added file left unmaterialised by an interrupted fast-forward", async () => {
+    const h = await makeHarness();
+    const first = await initRepo(h);
+    const remoteOid = await divergeRemote(h, first, { "notes/c.md": "remote c\n" }, "remote adds c");
+
+    // Local is behind at `first`, so mergeSafe will fast-forward.
+    await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: first, force: true });
+    await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
+    if (h.adapter.paths().includes("notes/c.md")) await h.adapter.remove("notes/c.md");
+
+    // Simulate the iOS kill: the fast-forward advances the ref (writeRef), then the checkout
+    // fails while trying to write the incoming file.
+    const realWrite = h.adapter.write.bind(h.adapter);
+    const realWriteBinary = h.adapter.writeBinary.bind(h.adapter);
+    h.adapter.write = async (p, ...rest) => {
+      if (p.endsWith("c.md")) throw new Error("SIMULATED app kill mid-checkout");
+      return realWrite(p, ...(rest as [string]));
+    };
+    h.adapter.writeBinary = async (p, ...rest) => {
+      if (p.endsWith("c.md")) throw new Error("SIMULATED app kill mid-checkout");
+      return realWriteBinary(p, ...(rest as [ArrayBuffer]));
+    };
+    await expect(h.safeGit.mergeSafe()).rejects.toBeTruthy();
+    h.adapter.write = realWrite;
+    h.adapter.writeBinary = realWriteBinary;
+
+    // The interrupted state: ref advanced to remote, c.md not on disk.
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(remoteOid);
+    expect(h.adapter.paths()).not.toContain("notes/c.md");
+
+    // The resync commit must REFUSE rather than delete the still-remote-tracked file.
+    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/never written to this device/i);
+
+    // notes/c.md is still tracked in HEAD — its deletion was not committed.
+    const tracked = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(tracked).toContain("notes/c.md");
+  });
 });
