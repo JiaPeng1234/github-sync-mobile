@@ -75,3 +75,32 @@ export async function setOriginRef(h: Harness, oid: string): Promise<void> {
     force: true,
   });
 }
+
+/**
+ * Build a second lineage to act as the remote, then restore local HEAD.
+ *
+ * Test scaffolding only — it uses force checkout to move between lineages,
+ * which product code must never do.
+ */
+export async function divergeRemote(
+  h: Harness,
+  base: string,
+  changes: Record<string, string>,
+  message: string,
+  /** Extra staging for cases text changes cannot express, e.g. binary writes. */
+  extra?: () => Promise<void>,
+): Promise<string> {
+  const localHead = await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main" });
+
+  await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: base, force: true });
+  await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
+  for (const [p, c] of Object.entries(changes)) await h.write(p, c);
+  for (const p of Object.keys(changes)) await git.add({ fs: h.fs, dir: h.dir, filepath: p });
+  if (extra) await extra();
+  const remoteOid = await git.commit({ fs: h.fs, dir: h.dir, message, author: COMMIT_AUTHOR });
+
+  await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: localHead, force: true });
+  await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
+  await setOriginRef(h, remoteOid);
+  return remoteOid;
+}

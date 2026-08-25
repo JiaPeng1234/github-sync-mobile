@@ -16,6 +16,11 @@ interface ThreeWayRow {
   theirsOid: string | null;
 }
 
+export interface ConflictResolution {
+  path: string;
+  choice: "mine" | "theirs";
+}
+
 /**
  * A conflict awaiting the user's decision. Recorded by `mergeSafe` and consumed by
  * `resolveConflicts`; while it is set, the repository is byte-identical to its
@@ -438,6 +443,7 @@ export class SafeGit {
       const conflicts = await this.describeConflicts(err, local, remote, bases[0]);
       if (conflicts.length === 0) throw err;
       this.log(`merge: conflict in ${conflicts.length} file(s) — nothing written`);
+      this.pending = { ourHead: local, theirHead: remote, files: conflicts };
       return { kind: "conflict", files: conflicts };
     }
 
@@ -644,6 +650,156 @@ export class SafeGit {
     }
   }
 
+  /**
+   * Discards the pending conflict without touching the repo, so the next sync
+   * offers it again. The working tree was never modified, so there is nothing
+   * to roll back.
+   */
+  abandonConflict(): void {
+    this.pending = null;
+    this.log("merge: conflict abandoned, repo unchanged");
+  }
+
+  /**
+   * Applies a whole-file decision per conflicting path and records a real merge
+   * commit with both parents.
+   *
+   * This is non-destructive: the losing content is already reachable from the
+   * parent commits, so nothing is lost — only postponed.
+   */
+  async resolveConflicts(resolutions: ConflictResolution[]): Promise<string> {
+    const pending = this.pending;
+    if (!pending) throw new Error("no pending conflict to resolve");
+
+    const byPath = new Map(resolutions.map((r) => [r.path, r.choice]));
+
+    // A file neither side can supply is undecidable, not unresolved: refusing to
+    // finish would leave the user permanently stuck with no way out on a phone.
+    const decidable = pending.files.filter(
+      (f) => !(f.ours.state === "unreadable" && f.theirs.state === "unreadable"),
+    );
+    const missing = decidable.filter((f) => !byPath.has(f.path)).map((f) => f.path);
+    if (missing.length > 0) {
+      throw new Error(`unresolved conflict(s): ${missing.join(", ")}`);
+    }
+
+    // Decide the complete set of writes BEFORE performing any of them.
+    //
+    // Everything that could fail is resolved first, so a refusal genuinely leaves
+    // the working tree untouched. Screening as we went would let an early write
+    // land and then abort with a message claiming nothing had changed.
+    const planned: Array<{ path: string; side: ConflictSide }> = [];
+
+    for (const file of decidable) {
+      const side = byPath.get(file.path) === "mine" ? file.ours : file.theirs;
+      if (side.state === "unreadable") {
+        throw new Error(
+          `Cannot resolve ${file.path}: the chosen version could not be read (${side.error}). ` +
+            `Nothing was changed.`,
+        );
+      }
+      planned.push({ path: file.path, side });
+    }
+
+    // Bring in every non-conflicting remote change too, using ordinary three-way
+    // logic: take theirs where the remote changed a path and this device did not.
+    //
+    // Walking the merge base as well as both heads is what makes remote *deletions*
+    // apply. Iterating only the remote's file list would skip them, leaving the local
+    // copy in place while the merge commit claimed that commit had been merged — so
+    // the deletion would never be offered again.
+    const bases = await git.findMergeBase({
+      ...this.base(),
+      oids: [pending.ourHead, pending.theirHead],
+    });
+    const rows = await this.threeWayOids(bases[0], pending.ourHead, pending.theirHead);
+    const conflictPaths = new Set(pending.files.map((f) => f.path));
+
+    for (const row of rows) {
+      if (conflictPaths.has(row.path)) continue;
+      if (this.exclude.isExcluded(row.path)) continue;
+      const remoteChanged = row.theirsOid !== row.baseOid;
+      const weChanged = row.oursOid !== row.baseOid;
+      if (!remoteChanged || weChanged) continue;
+
+      if (row.theirsOid === null) {
+        planned.push({ path: row.path, side: { state: "absent" } });
+        continue;
+      }
+      const theirs = await this.readAtCommit(pending.theirHead, row.path);
+      if (theirs.state === "unreadable") {
+        throw new Error(
+          `Cannot apply the remote version of ${row.path} (${theirs.error}). ` +
+            `Nothing was changed.`,
+        );
+      }
+      planned.push({ path: row.path, side: theirs });
+    }
+
+    // Everything that could be screened has been. A failure inside this loop (an
+    // adapter error mid-write) leaves earlier files applied and no merge commit;
+    // `pending` is deliberately not cleared, so the next sync re-offers the conflict
+    // rather than treating the partial state as merged.
+    for (const { path, side } of planned) {
+      await this.materialise(path, side);
+    }
+
+    const oid = await git.commit({
+      ...this.base(),
+      message: `Merge remote ${this.branch} (resolved ${pending.files.length} conflict(s))`,
+      author: this.author(),
+      parent: [pending.ourHead, pending.theirHead],
+    });
+
+    this.pending = null;
+    this.log(`merge: resolved and committed ${oid.slice(0, 7)}`);
+    return oid;
+  }
+
+  /**
+   * Writes one decided side to the working tree and stages it.
+   *
+   * Text is written as a string and binary as bytes; a binary file must never go
+   * through a string, or the attachment is corrupted. `absent` means the chosen
+   * side deleted the file, so the deletion is what gets staged.
+   */
+  private async materialise(filepath: string, side: ConflictSide): Promise<void> {
+    const fs = this.fsChannel;
+
+    if (side.state === "absent") {
+      try {
+        await fs.promises.unlink(this.join(filepath));
+      } catch {
+        // Already gone from the working tree.
+      }
+      await git.remove({ ...this.base(), filepath });
+      return;
+    }
+    if (side.state === "unreadable") {
+      // Callers must screen this out before reaching here.
+      throw new Error(`Refusing to write unreadable content for ${filepath}`);
+    }
+
+    // The vault adapter refuses to invent parent folders, and unlike
+    // isomorphic-git this call has no mkdir-and-retry behind it. A remote-added
+    // attachment in a folder this device does not have yet would otherwise fail
+    // partway through resolution.
+    const parent = filepath.includes("/")
+      ? filepath.slice(0, filepath.lastIndexOf("/"))
+      : "";
+    if (parent) {
+      try {
+        await fs.promises.mkdir(this.join(parent));
+      } catch {
+        // Already present.
+      }
+    }
+
+    const data = side.state === "text" ? side.content : side.bytes;
+    await fs.promises.writeFile(this.join(filepath), data);
+    await git.add({ ...this.base(), filepath });
+  }
+
 }
 
 /**
@@ -668,7 +824,13 @@ export class SafeGit {
  */
 const OID = /^[0-9a-f]{40}$/;
 
-function isPathAbsent(err: unknown, oid: string): boolean {
+// Exported for testing. This function is the switch that decides whether a git read
+// failure means "the file was deleted on that side" (absent -> materialise unlinks
+// and commits) or "the object could not be read" (unreadable -> refuse). Since a
+// misclassification here would turn a torn object into a durable deletion, its exact
+// branches are pinned directly rather than only through the harder-to-construct
+// behavioural path.
+export function isPathAbsent(err: unknown, oid: string): boolean {
   const e = err as { code?: string; data?: { what?: string } };
   if (e?.code !== "NotFoundError") return false;
   // Only trustworthy for a full oid. An abbreviated oid or a ref name such as
