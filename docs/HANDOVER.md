@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 159 passed
+npx vitest run       # expect 162 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -263,9 +263,20 @@ Two things the 7+8 round settled that the next session should carry:
   `hasLocalContent` now refuses on a recorded failure too. **When you write Task 11, rely on that
   throw propagating** — `decideConnect` must not swallow it.
 
-**Tasks 5–10 are done**, all fully reviewed. The entire SafeGit read/commit/merge/resolve surface
-exists and its guards are reproduced against real iso-git and mutation-pinned. `isPathAbsent` — the
-line that deletes on `absent` — was verified correct against real git's four error shapes.
+**Tasks 5–10 are done**, all fully reviewed, plus a whole-module (cross-task) review that found and
+fixed two composition seams. The entire SafeGit read/commit/merge/resolve surface exists and its
+guards are reproduced against real iso-git and mutation-pinned. `isPathAbsent` — the line that
+deletes on `absent` — was verified correct against real git's four error shapes.
+
+Two cross-method seams were found by the holistic review and are now guarded inside SafeGit —
+**Task 12's sync sequence must not undo them:**
+- `commitLocal` refuses a `[head=1, workdir=0, stage=0]` row (an interrupted fast-forward left a
+  remote-added file un-materialised; committing its "deletion" would destroy it on the remote). If
+  the sync loop ever sees that refusal, the right recovery is to re-run the merge/checkout, not to
+  force past it.
+- `mergeSafe` clears `pending` on non-conflict exits and `resolveConflicts` refuses a `pending` whose
+  heads no longer match the live refs. The sync service / conflict modal must not cache and replay a
+  stale conflict resolution.
 
 **Start with Task 11, SafeGit: connect decision, clone-safe, fetch, push** — the LAST SafeGit task.
 It adds `decideConnect`, `cloneSafe`, `fetch`, `push`. Its carried obligation (from the Task 7

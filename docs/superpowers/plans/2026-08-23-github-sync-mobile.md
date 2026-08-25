@@ -3848,6 +3848,18 @@ git commit -m "feat: connect decision, clone-safe, fetch, and guarded push"
 
 Orchestrates the fixed sequence using only SafeGit's safe exports.
 
+> **Carried from the whole-module review (2026-08-25):** SafeGit now guards two cross-method seams;
+> the sync sequence must honour, not undo them.
+> - `commitLocal` can now throw "…never written to this device… re-run sync" when an earlier
+>   fast-forward/merge was interrupted before materialising the working tree (a `[head=1,
+>   workdir=0, stage=0]` row). Treat this as a signal to re-run the merge/checkout step, NOT as a
+>   fatal error to surface raw and NOT something to force past — forcing would delete a
+>   remote-tracked file.
+> - `mergeSafe` clears `pending` on its non-conflict exits, and `resolveConflicts` refuses a
+>   `pending` whose `ourHead`/`theirHead` no longer match the live refs. The sync service and the
+>   conflict modal (Task 15) must not cache a conflict result across a later fetch/merge and replay
+>   it — re-derive the conflict from a fresh `mergeSafe` instead.
+
 **Files:**
 - Create: `src/sync/sync-service.ts`
 - Test: `tests/sync/sync-service.test.ts`

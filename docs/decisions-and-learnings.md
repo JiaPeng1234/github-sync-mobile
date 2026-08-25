@@ -563,6 +563,40 @@ crashed while its siblings explained themselves. It is now `{ kind: "unmergeable
 "type-change" }`. When a module's contract is "stop safely and explain," an edge the plan never
 enumerated should still land inside that contract, not beside it.
 
+### The dangerous bugs were in the seams between methods, not inside them
+
+Every method of SafeGit passed its own spec + code-quality + mutation review. A separate whole-module
+review, chartered only to look at how the methods COMPOSE, found two data-loss paths that none of the
+per-task reviews could have — because each needs two methods interacting across an app kill or a state
+change, and every test exercised one operation at a time.
+
+*Seam 1 — interrupted fast-forward becomes a deletion.* `fastForwardTo` advances the branch ref, then
+`checkoutTracked` materialises the working tree. Those two steps are not atomic, and iOS can kill the
+app between them. The result: HEAD tracks a remote-added file that was never written to disk. On the
+next sync, `commitLocal` runs first, sees `[head=1, workdir=0, stage=0]`, and — with no read failure to
+trip the existing guard — commits the file's *removal*, which then pushes and destroys it on the remote.
+`checkoutTracked` couldn't have re-materialised it either: re-running `mergeSafe` returns `up-to-date`
+(local === remote) and never touches it. The fix is a discriminator the existing guards didn't use: the
+index. A genuine deletion of a checked-out file is `[1,0,1]` — the index still holds it; an
+un-materialised checkout is `[1,0,0]`. `commitLocal` now refuses the latter. This is the same lesson as
+"a guard on one path doesn't protect a second path reaching the same decision" — recurring one level up,
+where the second path is *time* (an interrupted predecessor) rather than a different function.
+
+*Seam 2 — a stale conflict overwrites newer work.* `mergeSafe` set `pending` on its conflict exits but
+never cleared it on its non-conflict exits. So a recorded conflict could be "resolved" after the user
+had already committed newer content and a later fetch had fast-forwarded past it — `resolveConflicts`
+would trust the stale `pending`, overwrite the newer content on disk, and commit with the *old* parents,
+leaving the newer content unreachable in history. The resolution docstring's promise ("nothing is lost,
+only postponed") silently assumed `pending` was current. Fixed both ways: `mergeSafe` clears `pending`
+on every non-conflict exit, and `resolveConflicts` validates `pending`'s heads against the live refs and
+refuses if the repo moved. A cross-method invariant needs an owner; "safe by construction" has to mean
+the class enforces it, not that each method is locally fine.
+
+The process lesson: individually-correct methods are not a correct module. After the per-task reviews,
+one holistic pass looking only at composition — app-kill windows, shared mutable state (`pending`),
+whether a read/deletion path added late bypasses an early guard — was worth more than another round on
+any single method.
+
 ### The deletion discriminator was verified against reality, not its own tests
 
 Resolution deletes a file (unlink + commit) when the chosen side is `absent`, and a side is `absent`
