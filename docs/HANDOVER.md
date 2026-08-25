@@ -53,7 +53,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 7 SafeGit: state + status | ✅ implemented + reviewed **with Task 8** — see note below |
 | 8 SafeGit: commit | ✅ implemented + reviewed **with Task 7** — Task 7's tests call `commitLocal`, so they ship together |
 | 9 **SafeGit: safe merge** | ✅ implemented + reviewed — binary pre-screen reproduced against real git; `type-change` unmergeable added |
-| 10 **SafeGit: conflict resolution** | ⬜ heavily revised — byte-safe `materialise`, atomic screening |
+| 10 **SafeGit: conflict resolution** | ✅ implemented + reviewed — `isPathAbsent` reproduced against real git; atomic screening; byte-safe `materialise` |
 | 11 SafeGit: connect/clone/fetch/push | ⬜ |
 | 12 Sync service | ⬜ plan revised — `unmergeable` handling |
 | 13 GitHub API client | ⬜ |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 143 passed
+npx vitest run       # expect 159 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -263,23 +263,21 @@ Two things the 7+8 round settled that the next session should carry:
   `hasLocalContent` now refuses on a recorded failure too. **When you write Task 11, rely on that
   throw propagating** — `decideConnect` must not swallow it.
 
-**Tasks 5–9 are done**, all fully reviewed. `mergeSafe` is in; its central binary pre-screen was
-reproduced against real iso-git and is mutation-pinned.
+**Tasks 5–10 are done**, all fully reviewed. The entire SafeGit read/commit/merge/resolve surface
+exists and its guards are reproduced against real iso-git and mutation-pinned. `isPathAbsent` — the
+line that deletes on `absent` — was verified correct against real git's four error shapes.
 
-**Start with Task 10, SafeGit: conflict resolution** — the second-hardest task. It consumes the
-`pending` conflict set `mergeSafe` records and applies the user's whole-file choices. Two things the
-Task 9 review flagged for you to handle here:
+**Start with Task 11, SafeGit: connect decision, clone-safe, fetch, push** — the LAST SafeGit task.
+It adds `decideConnect`, `cloneSafe`, `fetch`, `push`. Its carried obligation (from the Task 7
+review) is already written into its plan section: `decideConnect` calls
+`if (await this.hasLocalContent())`, and `hasLocalContent` now THROWS on a read failure — let that
+throw propagate to the connect UI as refuse-and-explain; do NOT wrap it in a try/catch that treats a
+failure as "no local content", which would reopen the clone-over-your-vault data-loss hole.
 
-- **`isPathAbsent` must get its own tests in Task 10.** It is correct but untested, and it only
-  becomes destructive once resolution acts on `absent` (an `absent` side is unlinked and committed).
-  A missing *object* wrongly classified as `absent` would delete a file that exists. Test: bare-oid
-  `data.what` ⇒ absent; path-shaped `data.what` ⇒ unreadable; abbreviated-oid/ref ⇒ unreadable.
-- **Do not assume `pending` is absent.** `mergeSafe` sets it on both conflict exits but does not
-  clear it on clean-merge / fast-forward. Resolution should key on the current merge, not a stale
-  `pending`.
-
-**Then Task 11 (connect/clone/fetch/push).** Remember its carried warning: `decideConnect` must let
-`hasLocalContent()`'s read-failure throw propagate — do not swallow it into "no local content". These are the safety core and the hardest work in the
+**Then Tasks 12 → 19:** the sync service, GitHub API client, and the UI (log modal, conflict modal,
+settings tab, sync panel, plugin entry point, release workflow). Task 18 is the first time
+`src/main.ts` exists and `npm run build` can succeed. Task 19 ends with manual testing on the
+author's iPhone — the final gate; a green suite is not shipping confidence. These are the safety core and the hardest work in the
 plan. Task 7 carries two obligations inherited from Task 5, both already written into its plan
 section: treat a *thrown* `statusMatrix` as a refusal, not only a recorded failure; and confirm every
 claimed deletion against the working tree before staging it.

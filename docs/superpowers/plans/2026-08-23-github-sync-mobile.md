@@ -3173,6 +3173,23 @@ git commit -m "feat: safe merge with dry-run probe and non-destructive conflict 
 Phase-1 resolution: per file, keep mine or keep theirs. Non-destructive because the losing
 side already exists in history.
 
+> **Implementation notes (shipped 2026-08-25 — `src/git/safe-git.ts` is the source of truth):**
+> - **`join` was NOT re-added** — Tasks 7+8 already defined it; the plan's Step-3 code below still
+>   shows a trailing `private join`, which must be skipped.
+> - **The dry-run conflict exit in `mergeSafe` now sets `pending`** (the binary pre-screen exit
+>   already did). Without it, the text-conflict path left `pending` null and resolution threw
+>   "no pending conflict".
+> - **`isPathAbsent` is exported** (test-only) and its semantics were reproduced against real
+>   iso-git 1.41.8 across all four error shapes, incl. the torn-packfile case: a missing PATH gives
+>   a path-shaped `data.what` (⇒ absent, delete); a missing/corrupt OBJECT gives a bare-40-hex
+>   `data.what` (⇒ unreadable, REFUSE). It keys on the SHAPE of `data.what`, never on comparing the
+>   commit oid (the blob's own oid is echoed, so that comparison would misfire).
+> - **The plan's delete test below omits the `mergeSafe()` call** that populates `pending`; the real
+>   test adds it. And a test now pins that a remote DELETION of a NON-conflicting file applies to
+>   disk and the commit tree (the branch whose comment warns the merge commit would otherwise lie).
+> - **`divergeRemote` was promoted** from the merge test into `tests/helpers/repo.ts` (exported) and
+>   is imported by both the merge and resolve tests.
+
 **Files:**
 - Modify: `src/git/safe-git.ts`
 - Test: `tests/git/safe-git-resolve.test.ts`

@@ -563,6 +563,24 @@ crashed while its siblings explained themselves. It is now `{ kind: "unmergeable
 "type-change" }`. When a module's contract is "stop safely and explain," an edge the plan never
 enumerated should still land inside that contract, not beside it.
 
+### The deletion discriminator was verified against reality, not its own tests
+
+Resolution deletes a file (unlink + commit) when the chosen side is `absent`, and a side is `absent`
+only when `isPathAbsent(err, oid)` says so. If a merely-unreadable object — a torn packfile, an
+out-of-memory — were misclassified as absent, resolution would delete a file that still exists and
+commit the deletion. The function decides on the *shape* of isomorphic-git's `NotFoundError.data.what`:
+a bare 40-hex oid means a missing object (unreadable — refuse), anything path-shaped means a missing
+path (absent — safe to delete). Crucially it does **not** compare `data.what` against the commit oid,
+because `resolveFilepath` reassigns to the blob's own oid before the object read, so a torn packfile
+reports the blob oid — a comparison scheme would misfire exactly when it matters. Review reproduced
+all four error shapes against real iso-git 1.41.8, including the torn-packfile case, and confirmed the
+discriminator refuses rather than deletes. The general lesson: for the one line that can turn a read
+failure into a durable deletion, a passing unit test is not enough — the unit tests were written to
+match the function, so they cannot catch the function being wrong. The error shape had to be
+reproduced against the real library. (During this task the review instruction itself stated the
+expected direction inverted; the implementer matched the function's documented semantics instead, and
+the real-git reproduction settled which was right.)
+
 ---
 
 ## Part 4 — Process notes
