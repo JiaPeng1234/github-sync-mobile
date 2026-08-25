@@ -1,7 +1,7 @@
 import git, { TREE } from "isomorphic-git";
 import type { ExcludeMatcher } from "./exclude";
 import type { VaultFs } from "./fs-adapter";
-import type { ConflictFile, RepoStatus } from "../types";
+import type { ConflictFile, ConflictSide, MergeOutcome, RepoStatus } from "../types";
 import { COMMIT_AUTHOR } from "../constants";
 
 /** Extracts a human-readable message from an unknown thrown value. */
@@ -338,4 +338,343 @@ export class SafeGit {
   private author() {
     return COMMIT_AUTHOR;
   }
+
+  /**
+   * Integrates the fetched remote into the local branch without ever
+   * overwriting unsaved work.
+   *
+   * Order of decisions:
+   *  1. No remote ref, or identical oids  -> nothing to do.
+   *  2. Zero or multiple merge bases      -> surfaced as a conflict, because
+   *     isomorphic-git cannot merge these (no recursive strategy).
+   *  3. Local is an ancestor of remote    -> fast-forward, checking out only
+   *     non-excluded paths and never with force.
+   *  4. Diverged                          -> dry-run probe first. A conflict
+   *     means we write nothing at all; a clean probe means we merge for real.
+   */
+  async mergeSafe(): Promise<MergeOutcome> {
+    const local = await this.tryResolve(`refs/heads/${this.branch}`);
+    const remote = await this.tryResolve(`refs/remotes/origin/${this.branch}`);
+
+    if (!remote || !local) {
+      this.log("merge: no remote ref yet, nothing to merge");
+      return { kind: "up-to-date" };
+    }
+    if (local === remote) {
+      this.log("merge: already up to date");
+      return { kind: "up-to-date" };
+    }
+
+    let bases: string[];
+    try {
+      bases = await git.findMergeBase({ ...this.base(), oids: [local, remote] });
+    } catch {
+      bases = [];
+    }
+
+    if (bases.length === 0) {
+      this.log("merge: no common ancestor — refusing to merge unrelated histories");
+      return { kind: "unmergeable", reason: "unrelated-histories" };
+    }
+    if (bases.length > 1) {
+      this.log("merge: multiple merge bases — unsupported by the engine, stopping safely");
+      return { kind: "unmergeable", reason: "multiple-merge-bases" };
+    }
+
+    if (bases[0] === local) {
+      const oid = await this.fastForwardTo(remote);
+      return { kind: "fast-forward", oid };
+    }
+
+    // Diverged.
+    //
+    // Before letting the engine merge, check whether any file changed on both
+    // sides is binary. isomorphic-git's merge decodes both sides with a non-fatal
+    // UTF-8 conversion and re-encodes the result, so it would corrupt a binary and
+    // — because the three-way algorithm usually finds separable regions in a large
+    // file — report a CLEAN merge, never asking the user. Any binary in the set
+    // means we resolve whole-file instead.
+    //
+    // When a binary is present we surface *every* both-sides change, not only the
+    // binary ones. Conflicting on the binary alone would leave the text files that
+    // also changed on both sides to be swept in as "theirs", silently discarding
+    // this device's edits to them.
+    const bothChanged = await this.diffBothSides(local, remote, bases[0]);
+    if (await this.anyBinary(bothChanged, [bases[0], local, remote])) {
+      // describePaths drops excluded paths from what the user is asked about; the
+      // gate above already considered them, which is why the engine is skipped.
+      const files = await this.describePaths(bothChanged, local, remote);
+      this.pending = { ourHead: local, theirHead: remote, files };
+      this.log(`merge: ${files.length} path(s) include binary content — resolving whole-file`);
+      return { kind: "conflict", files };
+    }
+
+    // No binaries involved, so the engine's text merge is safe: valid UTF-8
+    // survives its decode/re-encode round trip losslessly, and diff3 can combine
+    // non-overlapping edits to the same note instead of forcing a choice.
+    try {
+      await git.merge({
+        ...this.base(),
+        ours: this.branch,
+        theirs: `refs/remotes/origin/${this.branch}`,
+        fastForward: false,
+        abortOnConflict: true,
+        dryRun: true,
+        author: this.author(),
+      });
+    } catch (err) {
+      // A path that is a file on one side and a directory on the other is a type
+      // change. isomorphic-git has no strategy for it and throws
+      // MergeNotSupportedError at the dry-run, so nothing has been written. Surface
+      // it as a structured unmergeable outcome rather than an uncaught throw, the
+      // same stance as the other unmergeable cases. It cannot be surfaced as a
+      // whole-file conflict here because the conflict UI would have to render a path
+      // that is a directory on one side; that is deferred.
+      const code = (err as { code?: string; name?: string }).code ?? (err as Error)?.name;
+      if (code === "MergeNotSupportedError") {
+        this.log("merge: type change (file vs directory) — unsupported by the engine, stopping safely");
+        return { kind: "unmergeable", reason: "type-change" };
+      }
+      const conflicts = await this.describeConflicts(err, local, remote, bases[0]);
+      if (conflicts.length === 0) throw err;
+      this.log(`merge: conflict in ${conflicts.length} file(s) — nothing written`);
+      return { kind: "conflict", files: conflicts };
+    }
+
+    // Probe was clean, so this cannot conflict.
+    const result = await git.merge({
+      ...this.base(),
+      ours: this.branch,
+      theirs: `refs/remotes/origin/${this.branch}`,
+      fastForward: false,
+      abortOnConflict: true,
+      dryRun: false,
+      author: this.author(),
+    });
+    const merged = result.oid ?? (await git.resolveRef({ ...this.base(), ref: "HEAD" }));
+    await this.checkoutTracked(merged);
+    this.log(`merge: merged as ${merged.slice(0, 7)}`);
+    return { kind: "merged", oid: merged };
+  }
+
+  /**
+   * Moves the branch to `oid` and materialises only non-excluded paths.
+   * `force` is deliberately absent: any path that would clobber an untracked
+   * working-tree file is left alone rather than overwritten.
+   */
+  private async fastForwardTo(oid: string): Promise<string> {
+    await git.writeRef({
+      ...this.base(),
+      ref: `refs/heads/${this.branch}`,
+      value: oid,
+      force: true,
+    });
+    await this.checkoutTracked(oid);
+    this.log(`merge: fast-forwarded to ${oid.slice(0, 7)}`);
+    return oid;
+  }
+
+  /**
+   * Checks out the non-excluded files of a commit. Never forces.
+   *
+   * Measured caveat: a non-force checkout to a ref that is already checked out is a
+   * no-op. It does not restore a file deleted from the working tree, and it does not
+   * revert a locally modified one. That is the safe direction — it cannot clobber — but
+   * it means this is not a repair mechanism, and no caller should treat it as one.
+   */
+  private async checkoutTracked(oid: string): Promise<void> {
+    const tracked = await git.listFiles({ ...this.base(), ref: oid });
+    const wanted = this.exclude.withoutExcluded(tracked);
+    if (wanted.length === 0) return;
+    await git.checkout({
+      ...this.base(),
+      ref: this.branch,
+      filepaths: wanted,
+      force: false,
+    });
+  }
+
+  /**
+   * Turns a merge failure into per-file conflict records carrying both sides'
+   * content, filtering out any path the user excluded.
+   */
+  private async describeConflicts(
+    err: unknown,
+    local: string,
+    remote: string,
+    base: string,
+  ): Promise<ConflictFile[]> {
+    const name = (err as { code?: string; name?: string })?.code ?? (err as Error)?.name;
+    if (name !== "MergeConflictError") return [];
+
+    const reported =
+      (err as { data?: { filepaths?: string[] } })?.data?.filepaths ??
+      (await this.diffBothSides(local, remote, base));
+
+    return this.describePaths(reported, local, remote);
+  }
+
+  /** Builds conflict records for the given paths, dropping excluded ones. */
+  private async describePaths(
+    paths: string[],
+    local: string,
+    remote: string,
+  ): Promise<ConflictFile[]> {
+    const out: ConflictFile[] = [];
+    for (const path of this.exclude.withoutExcluded(paths)) {
+      out.push({
+        path,
+        ours: await this.readAtCommit(local, path),
+        theirs: await this.readAtCommit(remote, path),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * True when any of the given paths is binary in any of the given commits.
+   *
+   * Binary-ness is decided by whether the bytes survive a strict UTF-8 decode —
+   * the same test `readAtCommit` uses — not by file extension, which would miss an
+   * unlabelled attachment.
+   *
+   * Deliberately does NOT skip excluded paths. This is a safety gate, not a list of
+   * things to materialise. An excluded path can still be tracked by the remote, and
+   * the engine merges the whole tree regardless of what we check out, so filtering
+   * here would let it corrupt an excluded binary inside the commit and push it.
+   * "Don't sync this" must not become "corrupt this silently".
+   */
+  private async anyBinary(paths: string[], oids: string[]): Promise<boolean> {
+    for (const path of paths) {
+      for (const oid of oids) {
+        const side = await this.readAtCommit(oid, path);
+        if (side.state === "binary") return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Per-path blob oids in the merge base, ours, and theirs, in one tree walk.
+   *
+   * Compares oids, never content: content comparison would have to decode first,
+   * and two different binaries can decode to the same string of replacement
+   * characters, hiding a real conflict.
+   *
+   * A single `git.walk` is used rather than per-path `readBlob` calls because
+   * `readBlob` inflates the whole blob just to learn its oid. On a vault of a few
+   * thousand notes that difference is roughly 16 seconds versus 30 milliseconds,
+   * and inflating every attachment three times risks being killed for memory on a
+   * phone. `entry.oid()` reads the tree entry only.
+   */
+  private async threeWayOids(
+    base: string,
+    local: string,
+    remote: string,
+  ): Promise<ThreeWayRow[]> {
+    const rows: ThreeWayRow[] = [];
+    await git.walk({
+      ...this.base(),
+      trees: [TREE({ ref: base }), TREE({ ref: local }), TREE({ ref: remote })],
+      map: async (filepath, entries) => {
+        if (filepath === ".") return undefined;
+        const types = await Promise.all(entries.map((e) => (e ? e.type() : null)));
+        const anyTree = types.some((t) => t === "tree");
+        const anyBlob = types.some((t) => t === "blob");
+
+        // A path that is a directory on every side is just a directory: let the walk
+        // descend and compare its leaves.
+        if (anyTree && !anyBlob) return undefined;
+
+        // A path that is a file on one side and a directory on another is a type
+        // change. Record it with a null oid for the directory sides so it is treated
+        // as changed rather than silently dropped -- skipping it would lose the
+        // change without telling anyone.
+        const oids = await Promise.all(
+          entries.map(async (e, i) => (e && types[i] === "blob" ? e.oid() : null)),
+        );
+        const [baseOid, oursOid, theirsOid] = oids;
+        rows.push({ path: filepath, baseOid, oursOid, theirsOid });
+        // Still descend if some side is a directory, so its contents are compared too.
+        return undefined;
+      },
+    });
+    return rows;
+  }
+
+  /** Paths that changed on both sides, and differently, since the merge base. */
+  private async diffBothSides(
+    local: string,
+    remote: string,
+    base: string,
+  ): Promise<string[]> {
+    const rows = await this.threeWayOids(base, local, remote);
+    return rows
+      .filter(
+        (r) =>
+          r.oursOid !== r.baseOid && r.theirsOid !== r.baseOid && r.oursOid !== r.theirsOid,
+      )
+      .map((r) => r.path);
+  }
+
+  /**
+   * One side's version of a file at a commit.
+   *
+   * Keeps the raw bytes and only decodes when the content is valid UTF-8, using a
+   * fatal decoder. A non-fatal decode would replace every invalid byte with U+FFFD,
+   * and writing that back during resolution would corrupt the attachment.
+   *
+   * A read failure is reported as `unreadable`, never as `absent`: resolution
+   * deletes and commits on `absent`, so conflating the two would turn a torn
+   * packfile or an out-of-memory into a durable deletion of a file that exists.
+   */
+  private async readAtCommit(oid: string, filepath: string): Promise<ConflictSide> {
+    let bytes: Uint8Array;
+    try {
+      const { blob } = await git.readBlob({ ...this.base(), oid, filepath });
+      bytes = blob;
+    } catch (err) {
+      if (isPathAbsent(err, oid)) return { state: "absent" };
+      return { state: "unreadable", error: message(err) };
+    }
+    try {
+      return { state: "text", content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    } catch {
+      return { state: "binary", bytes };
+    }
+  }
+
+}
+
+/**
+ * True when a git read failed because the path is genuinely absent from that tree,
+ * as opposed to an object being unreadable.
+ *
+ * isomorphic-git raises `NotFoundError` for both, so the code alone cannot decide.
+ * The distinction is in `data.what`: for a missing path it is a human-readable
+ * string like `file or directory found at "<oid>:<path>"`, whereas for a missing
+ * object it is the bare oid. Testing that shape is the reliable discriminator.
+ *
+ * Comparing `data.what` against the commit oid does NOT work, even though the
+ * library does something similar elsewhere for a missing commit: `resolveFilepath`
+ * reassigns the oid to the blob's own oid before reading the object, so a torn
+ * packfile reports the blob oid, which never equals the commit oid passed in. That
+ * mistake classified a damaged object as `absent`, and resolution acts on `absent`
+ * by deleting and committing — turning corruption into deliberate-looking deletion.
+ *
+ * ENOENT is deliberately not treated as absent: that is a filesystem condition, and
+ * the fs bridge keeps it distinct precisely so a read failure cannot read as a
+ * deletion.
+ */
+const OID = /^[0-9a-f]{40}$/;
+
+function isPathAbsent(err: unknown, oid: string): boolean {
+  const e = err as { code?: string; data?: { what?: string } };
+  if (e?.code !== "NotFoundError") return false;
+  // Only trustworthy for a full oid. An abbreviated oid or a ref name such as
+  // "main" is not expanded before the object read, so it reports itself in
+  // `data.what` and would look like a missing path. Answering false in that case
+  // routes to `unreadable`, which refuses rather than deletes.
+  if (!OID.test(oid)) return false;
+  return !OID.test(e.data?.what ?? "");
 }

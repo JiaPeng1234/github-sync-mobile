@@ -59,12 +59,14 @@ export type MergeOutcome =
   | { kind: "unmergeable"; reason: UnmergeableReason };
 
 /**
- * Histories isomorphic-git cannot merge: it implements no recursive merge
+ * Cases isomorphic-git cannot merge: it implements no recursive merge
  * strategy, so it throws when several merge bases exist (the criss-cross case
- * from two devices diverging), and it cannot join two unrelated roots. We catch
- * both and stop safely rather than letting them crash or improvise.
+ * from two devices diverging), and it cannot join two unrelated roots. It also
+ * cannot merge a path that is a file on one side and a directory on the other
+ * (`type-change`) — iso-git has no strategy for a type change and throws. We
+ * catch all three and stop safely rather than letting them crash or improvise.
  */
-export type UnmergeableReason = "unrelated-histories" | "multiple-merge-bases";
+export type UnmergeableReason = "unrelated-histories" | "multiple-merge-bases" | "type-change";
 
 export interface RepoStatus {
   /** Non-excluded files differing from HEAD. */
