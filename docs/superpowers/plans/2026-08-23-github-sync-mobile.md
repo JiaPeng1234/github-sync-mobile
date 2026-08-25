@@ -2494,6 +2494,27 @@ git commit -m "feat: commit local changes, skipping excluded paths and empty com
 
 The heart of the plugin. Every branch of this method must be non-destructive.
 
+> **Implementation notes (shipped 2026-08-25 — `src/git/safe-git.ts` is the source of truth):**
+> - **The binary pre-screen was re-confirmed against real iso-git.** Review reproduced it
+>   end-to-end: without the pre-screen a 200-byte binary changed in two separable regions on both
+>   sides merges "clean" into a 440-byte blob with every invalid byte rewritten to U+FFFD. The
+>   guard is load-bearing and now mutation-pinned. `anyBinary` must NOT skip excluded paths — an
+>   excluded binary is still merged into the tree and pushed; a test now pins that.
+> - **`checkoutTracked` uses `force: false`** (Invariant 3). A flip to `force: true` silently
+>   clobbers local content and returns `fast-forward`; a checkout-collision test now catches it.
+> - **A new `unmergeable` reason `"type-change"`** was added to `src/types.ts`. A path that is a
+>   file on one side and a directory on the other makes iso-git throw `MergeNotSupportedError` at
+>   the dry-run (nothing written); `mergeSafe` now catches it and returns
+>   `{ kind: "unmergeable", reason: "type-change" }` rather than rethrowing. Surfacing it as a
+>   whole-file conflict is deferred (the conflict UI would have to render a directory-side path).
+> - **Step 4 below says "15 tests"; the actual test block has 14** (+3 added in review = 17 in the
+>   merge file now). Cosmetic drift.
+> - **Carried to Task 10:** `isPathAbsent` (missing-object vs missing-path discriminator) is
+>   correct but UNTESTED — it only becomes destructive when resolution acts on `absent`. Task 10
+>   MUST add its tests (bare-oid `data.what` ⇒ absent; path-shaped ⇒ unreadable; abbreviated-oid/ref
+>   ⇒ unreadable). Also: `pending` is set on both conflict exits but not cleared on the clean-merge
+>   / fast-forward paths — Task 10 must not assume a stale `pending` is absent.
+
 **Files:**
 - Modify: `src/git/safe-git.ts`
 - Test: `tests/git/safe-git-merge.test.ts`

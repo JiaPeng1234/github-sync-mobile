@@ -52,7 +52,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 6 HTTP client | ✅ implemented, both reviews passed — real git http-backend + iso-git 1.41.8 clone confirmed the array response body works on the real route |
 | 7 SafeGit: state + status | ✅ implemented + reviewed **with Task 8** — see note below |
 | 8 SafeGit: commit | ✅ implemented + reviewed **with Task 7** — Task 7's tests call `commitLocal`, so they ship together |
-| 9 **SafeGit: safe merge** | ⬜ heavily revised — binary pre-screen, `threeWayOids`, `isPathAbsent` |
+| 9 **SafeGit: safe merge** | ✅ implemented + reviewed — binary pre-screen reproduced against real git; `type-change` unmergeable added |
 | 10 **SafeGit: conflict resolution** | ⬜ heavily revised — byte-safe `materialise`, atomic screening |
 | 11 SafeGit: connect/clone/fetch/push | ⬜ |
 | 12 Sync service | ⬜ plan revised — `unmergeable` handling |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 126 passed
+npx vitest run       # expect 143 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -263,13 +263,23 @@ Two things the 7+8 round settled that the next session should carry:
   `hasLocalContent` now refuses on a recorded failure too. **When you write Task 11, rely on that
   throw propagating** — `decideConnect` must not swallow it.
 
-**Start with Task 9, SafeGit: safe merge.** This is the hardest and most safety-critical task in the
-whole plan — binary pre-screen, `threeWayOids`, commit-before-merge (Invariant 2), and the
-`unmergeable` outcomes (multiple merge bases / unrelated histories). Do not shortcut it; give it the
-full drill (spec + quality review, mutation, real-git probes of every guard, and an empirical check
-that iso-git's own merge does the lossy binary round-trip the pre-screen exists to prevent).
+**Tasks 5–9 are done**, all fully reviewed. `mergeSafe` is in; its central binary pre-screen was
+reproduced against real iso-git and is mutation-pinned.
 
-**Then Tasks 10 → 11 in order.** These are the safety core and the hardest work in the
+**Start with Task 10, SafeGit: conflict resolution** — the second-hardest task. It consumes the
+`pending` conflict set `mergeSafe` records and applies the user's whole-file choices. Two things the
+Task 9 review flagged for you to handle here:
+
+- **`isPathAbsent` must get its own tests in Task 10.** It is correct but untested, and it only
+  becomes destructive once resolution acts on `absent` (an `absent` side is unlinked and committed).
+  A missing *object* wrongly classified as `absent` would delete a file that exists. Test: bare-oid
+  `data.what` ⇒ absent; path-shaped `data.what` ⇒ unreadable; abbreviated-oid/ref ⇒ unreadable.
+- **Do not assume `pending` is absent.** `mergeSafe` sets it on both conflict exits but does not
+  clear it on clean-merge / fast-forward. Resolution should key on the current merge, not a stale
+  `pending`.
+
+**Then Task 11 (connect/clone/fetch/push).** Remember its carried warning: `decideConnect` must let
+`hasLocalContent()`'s read-failure throw propagate — do not swallow it into "no local content". These are the safety core and the hardest work in the
 plan. Task 7 carries two obligations inherited from Task 5, both already written into its plan
 section: treat a *thrown* `statusMatrix` as a refusal, not only a recorded failure; and confirm every
 claimed deletion against the working tree before staging it.

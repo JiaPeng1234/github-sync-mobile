@@ -539,6 +539,30 @@ all, because the bridge records every such failure and `scanWorkingTree`'s guard
 only be reached by a `list`-omits-file / `stat`-still-finds-file shape that records nothing. A test
 that reaches a guard by a convenient route proves nothing about the route that loses data.
 
+### A correct guard with no test is a regression waiting to ship
+
+Task 9's merge code was found correct — the binary pre-screen was reproduced end-to-end against real
+isomorphic-git (a 200-byte binary changed in two separable regions merged "clean" into a 440-byte
+blob with every invalid byte rewritten to U+FFFD, reported as success) and it correctly prevents
+that. But two of its load-bearing guards had *no test that would notice their removal*. Mutating
+`checkoutTracked`'s `force: false` to `force: true` — the exact call class that destroyed the
+author's notes — left all fourteen tests green while silently clobbering local content and returning
+`fast-forward`. Making `anyBinary` skip excluded paths likewise passed, while corrupting an excluded
+attachment and pushing it. The code was right; the suite could not tell if it stopped being right.
+The lesson: for a guard whose failure is silent data loss, the test that proves a mutation *fails* is
+as load-bearing as the guard itself. Both are now pinned by a checkout-collision test and an
+excluded-binary test.
+
+### Stop safely and explain, uniformly — including the cases the plan forgot
+
+`mergeSafe` already turned unrelated histories and multiple merge bases into a structured
+`unmergeable` outcome, but a file-vs-directory type change fell through as a raw
+`MergeNotSupportedError` thrown uncaught. It was loud and wrote nothing (the throw is at the dry-run
+stage), so no data was at risk — but it was an inconsistency: one class of "the engine can't do this"
+crashed while its siblings explained themselves. It is now `{ kind: "unmergeable", reason:
+"type-change" }`. When a module's contract is "stop safely and explain," an edge the plan never
+enumerated should still land inside that contract, not beside it.
+
 ---
 
 ## Part 4 — Process notes
