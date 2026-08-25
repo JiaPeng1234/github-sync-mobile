@@ -49,7 +49,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 3 Types and constants | ✅ implemented, spec review passed, quality review approved after 4 rounds |
 | 4 Exclude engine | ✅ implemented, both reviews passed |
 | 5 Filesystem bridge | ✅ implemented, both reviews passed — quality review closed a coverage gap on the two content-read guards |
-| 6 HTTP client | ⬜ plan revised — the two `requestUrl` rules |
+| 6 HTTP client | ✅ implemented, both reviews passed — real git http-backend + iso-git 1.41.8 clone confirmed the array response body works on the real route |
 | 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
 | 8 SafeGit: commit | ⬜ |
 | 9 **SafeGit: safe merge** | ⬜ heavily revised — binary pre-screen, `threeWayOids`, `isPathAbsent` |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 93 passed
+npx vitest run       # expect 101 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -248,21 +248,19 @@ stop an unreadable `.git/index` from shipping an empty-tree commit) were unteste
 succeeds, each verified by mutation. Also dropped the unused `"exists"` from `VaultAdapter` and
 reframed two changelog comments as invariants. 93 tests.
 
-**Start with Task 6, the HTTP client.** Small and self-contained.
+**Task 6 is done** (both reviews passed; the two `requestUrl` rules are in the code and pinned by
+tests). Response headers are now lowercased in the bridge and the request-body exact-size copy is
+mutation-pinned.
+
+**Start with Task 7, SafeGit: construction, repo state, and status.** The first piece of the safety
+core.
 
 ```
-Plan section: "## Task 6: HTTP client"
-Creates:      src/git/http-client.ts
-Tests:        tests/git/http-client.test.ts
+Plan section: "## Task 7: SafeGit — construction, repo state, and status"
+Creates:      src/git/safe-git.ts (the ONLY module allowed to import isomorphic-git)
 ```
 
-Two rules are already settled and stated in that plan section — do not re-derive them. Always
-`await` the call and then read properties off the result (the awaitable-property form
-`requestUrl(p).json` is not modelled by the test stub and reads as `undefined` under test), and
-always pass `throw: false` and inspect the status yourself rather than keying on `err.status`, which
-the real typings do not promise.
-
-**Then Tasks 7 → 8 → 9 → 10 → 11 in order.** These are the safety core and the hardest work in the
+**Then Tasks 8 → 9 → 10 → 11 in order.** These are the safety core and the hardest work in the
 plan. Task 7 carries two obligations inherited from Task 5, both already written into its plan
 section: treat a *thrown* `statusMatrix` as a refusal, not only a recorded failure; and confirm every
 claimed deletion against the working tree before staging it.
