@@ -48,7 +48,7 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 2 Test harness | ✅ implemented, spec review passed, quality review approved |
 | 3 Types and constants | ✅ implemented, spec review passed, quality review approved after 4 rounds |
 | 4 Exclude engine | ✅ implemented, both reviews passed |
-| 5 Filesystem bridge | ✅ implemented, spec review passed — **code-quality review still owed** |
+| 5 Filesystem bridge | ✅ implemented, both reviews passed — quality review closed a coverage gap on the two content-read guards |
 | 6 HTTP client | ⬜ plan revised — the two `requestUrl` rules |
 | 7 SafeGit: state + status | ⬜ plan revised — `pending`, `ThreeWayRow`, `TREE` import |
 | 8 SafeGit: commit | ⬜ |
@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 90 passed
+npx vitest run       # expect 93 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -239,17 +239,16 @@ Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-an
 
 ## 6. What to do next
 
-**First, finish Task 5.** Its implementation and spec review are done, but it never had a
-code-quality review. Everything else has had both. Dispatch that before starting Task 6, or the
-project's most delicate module ships with half the scrutiny the rest got.
+**Task 5 is done.** Its code-quality review (2026-08-25) ran the full drill — 15 mutations, real
+isomorphic-git 1.41 probes — and confirmed the module is coherent (not a pile of patches), the
+comments are load-bearing rationale, and the `readFailures` contract is the right shape for Task 7.
+The one real finding was a coverage gap: the two content-read guards in `readFile` (the ones that
+stop an unreadable `.git/index` from shipping an empty-tree commit) were untested because
+`failReadsAt` fails `stat` first. Now pinned by two tests that fail `read`/`readBinary` while `stat`
+succeeds, each verified by mutation. Also dropped the unused `"exists"` from `VaultAdapter` and
+reframed two changelog comments as invariants. 93 tests.
 
-What that review should look at: the bridge is now the seam every later data-loss proof runs
-through, and it has accumulated four rounds of fixes (root mapping, read-failure recording,
-backslash handling, exact-size copies). Worth asking whether it is still coherent as a design rather
-than a pile of patches, whether the comments have become a changelog that will rot, and whether the
-`readFailures` contract is the right shape for Task 7 to consume.
-
-**Then Task 6, the HTTP client.** Small and self-contained.
+**Start with Task 6, the HTTP client.** Small and self-contained.
 
 ```
 Plan section: "## Task 6: HTTP client"
