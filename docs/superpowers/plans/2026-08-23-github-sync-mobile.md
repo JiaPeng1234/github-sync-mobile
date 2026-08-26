@@ -4663,9 +4663,50 @@ git commit -m "feat: whole-file conflict resolution modal"
 > **Wiring:** Task 17/18 catch `commitLocal`'s `/ambiguous, resolvable/i` throw out of the sync flow
 > and open this modal instead of surfacing the raw error. The modal calls `restoreFromHead` or
 > `confirmDeletion` on the same `SafeGit` instance, then re-runs the sync. `tsc`-only, no test suite
-> (DOM modal), like Tasks 14/15. The exact code is authored when this task is implemented, mirroring
-> `conflict-modal.ts`'s structure (onOpen/onClose with `override`, resolved-flag guard so dismissing
-> without choosing leaves the repo untouched — dismiss = do nothing, NOT delete).
+> (DOM modal), like Tasks 14/15.
+>
+> **Implemented 2026-08-26.** Two parts, both reviewed:
+>
+> **Part A — a read-only SafeGit query** to enumerate the ambiguous paths, because `commitLocal`'s
+> thrown Error names only the first offending path. Added to `src/git/safe-git.ts` (real-git tested,
+> mutation-pinned; inherits `scanWorkingTree`'s read-failure refusal so an under-report — which would
+> hide a recoverable file — THROWS rather than returning a partial list):
+>
+> ```ts
+>   /**
+>    * Lists the paths in the ambiguous interrupted-checkout state ([head=1, workdir=0,
+>    * stage=0]) — in committed history, absent from disk, never staged. `commitLocal`
+>    * refuses to guess these; the recovery UI shows this list and lets the user choose
+>    * restoreFromHead (interrupted download) or confirmDeletion (real deletion).
+>    *
+>    * Read-only. Reuses scanWorkingTree, so it inherits the read-failure refusal: a
+>    * transient unreadable directory THROWS rather than under-reporting, because an
+>    * under-report here could hide a file the user needs to recover.
+>    */
+>   async listInterruptedCheckouts(): Promise<string[]> {
+>     const matrix = await this.scanWorkingTree();
+>     return matrix
+>       .filter(([filepath, head, workdir, stage]) =>
+>         head === 1 && workdir === 0 && stage === 0 && !this.exclude.isExcluded(filepath),
+>       )
+>       .map(([filepath]) => filepath);
+>   }
+> ```
+>
+> Tests: `tests/git/safe-git-recovery.test.ts` (6, real git) — returns a real interrupted-ff `[1,0,0]`;
+> excludes a genuine deletion `[1,0,1]`; excludes unchanged/modified; excludes excluded paths; THROWS on
+> an injected read failure. (Note: a full stage+disk `git.remove` also collapses to `[1,0,0]`, but on
+> iOS there is no staging path, so that state only ever arises from an interrupted checkout — routing it
+> to recovery is the safe choice, matching `commitLocal`'s existing `stage===0` contract.)
+>
+> **Part B — `src/ui/recovery-modal.ts`** (`tsc`-only, mirrors `conflict-modal.ts`). PURE UI: takes
+> `paths` + `onRestore`/`onDelete` callbacks (it holds no SafeGit reference; the caller owns which
+> method each drives). `override onOpen`/`onClose`. Restore is the primary/safe action (fires
+> immediately). Delete is secondary and ARMS on the first tap (relabels to "Really delete N files from
+> your GitHub backup too? Tap again to confirm", in `--text-error`), firing `onDelete` only on the
+> second tap — a single tap can never commit a deletion. Dismissing (X/Esc) calls NO callback at all —
+> unlike `ConflictModal`'s `onAbandon`, dismiss here is truly inert because there is no safe default.
+> An `acted` flag is set only inside a button handler.
 
 ---
 

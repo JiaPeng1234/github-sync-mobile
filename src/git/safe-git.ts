@@ -320,6 +320,25 @@ export class SafeGit {
   }
 
   /**
+   * Lists the paths in the ambiguous interrupted-checkout state ([head=1, workdir=0,
+   * stage=0]) — in committed history, absent from disk, never staged. `commitLocal`
+   * refuses to guess these; the recovery UI shows this list and lets the user choose
+   * restoreFromHead (interrupted download) or confirmDeletion (real deletion).
+   *
+   * Read-only. Reuses scanWorkingTree, so it inherits the read-failure refusal: a
+   * transient unreadable directory THROWS rather than under-reporting, because an
+   * under-report here could hide a file the user needs to recover.
+   */
+  async listInterruptedCheckouts(): Promise<string[]> {
+    const matrix = await this.scanWorkingTree();
+    return matrix
+      .filter(([filepath, head, workdir, stage]) =>
+        head === 1 && workdir === 0 && stage === 0 && !this.exclude.isExcluded(filepath),
+      )
+      .map(([filepath]) => filepath);
+  }
+
+  /**
    * Recovery escape hatch for the "not mine — it was an interrupted download" case.
    *
    * When `commitLocal` refused a `[head=1, workdir=0, stage=0]` path because it could not

@@ -70,7 +70,7 @@ tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 | 14 Log modal | ✅ implemented, reviewed — renders `SyncReport` into a copyable `<pre>`; `tsc`-only (no test); Copy button hardened for iOS WebView clipboard (falls back to a Notice); no PAT leak (renders raw error `.message` — see [[log-modal-shows-raw-error-messages]]) |
 | 15 Conflict modal | ✅ implemented, reviewed — whole-file keep-mine/keep-theirs, metadata-only (P0); dismiss=onAbandon, both-unreadable stays in history, no partial resolve; `tsc`-only. Design resolved with user (see §6) |
 | 15b Recovery modal | ⬜ NEW — interrupted-checkout restore/delete stop-and-ask (Restore primary); design resolved with user; wire into sync flow at Task 17/18 |
-| 16 Settings tab | ⬜ plan revised — exclude-everything warning + vault coverage readout |
+| 16 Settings tab | ✅ implemented, reviewed — token/owner/repo/exclude fields, Test connection (try/catch for offline), `.obsidian` token-leak confirm gate (fail-safe), exclude-everything + vault-coverage warnings; `tsc`-only (errors only on `../main` until Task 18) |
 | 17 Sync panel | ⬜ |
 | 18 Plugin entry point | ⬜ plan revised |
 | 19 Release workflow + README | ⬜ |
