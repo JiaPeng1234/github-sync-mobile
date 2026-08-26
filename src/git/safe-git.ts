@@ -45,6 +45,12 @@ export interface SafeGitOptions {
   onLog?: (line: string) => void;
 }
 
+export type ConnectDecision =
+  | { kind: "clone-safe" }
+  | { kind: "init-push" }
+  | { kind: "reconnect" }
+  | { kind: "refuse"; reason: string };
+
 /**
  * The only module that imports isomorphic-git.
  *
@@ -920,6 +926,121 @@ export class SafeGit {
     await git.add({ ...this.base(), filepath });
   }
 
+  /**
+   * Decides how to connect, refusing rather than improvising whenever the
+   * assumption "remote has content, local vault is empty" does not hold.
+   */
+  async decideConnect(opts: { remoteHasContent: boolean }): Promise<ConnectDecision> {
+    const existing = await this.currentRemoteUrl();
+    if (existing && !sameRepo(existing, this.url)) {
+      return {
+        kind: "refuse",
+        reason:
+          `This vault is already connected to ${existing}. ` +
+          `Disconnect first before connecting it to a different repository.`,
+      };
+    }
+    if (existing) return { kind: "reconnect" };
+
+    if (!opts.remoteHasContent) return { kind: "init-push" };
+
+    // Note the interaction with the exclude set: `hasLocalContent()` asks whether any
+    // NON-excluded file exists, so an exclude pattern that matches everything makes any
+    // vault look empty and sends this decision down the clone-safe path. Task 16 warns
+    // about such a pattern at the point of entry; nothing here can distinguish "empty
+    // vault" from "everything excluded", which is why that warning matters.
+    if (await this.hasLocalContent()) {
+      return {
+        kind: "refuse",
+        reason:
+          "This vault already contains notes, and the remote repository also has content. " +
+          "Connecting would mix two unrelated histories. Use an empty vault on this device, " +
+          "or reconcile the two on a desktop first.",
+      };
+    }
+    return { kind: "clone-safe" };
+  }
+
+  /**
+   * Clones history without writing anything, then materialises only
+   * non-excluded paths. The remote's `.obsidian/*` therefore stays in history
+   * but never lands on disk, so it cannot collide with this device's config.
+   */
+  async cloneSafe(): Promise<void> {
+    this.log("clone: fetching history without checkout");
+    await git.clone({
+      ...this.net(),
+      ref: this.branch,
+      singleBranch: true,
+      noCheckout: true,
+    });
+
+    const head = await this.tryResolve(`refs/heads/${this.branch}`);
+    if (!head) {
+      this.log("clone: remote had no commits on this branch");
+      return;
+    }
+    const tracked = await git.listFiles({ ...this.base(), ref: head });
+    const wanted = this.exclude.withoutExcluded(tracked);
+    this.log(`clone: checking out ${wanted.length} of ${tracked.length} tracked path(s)`);
+    if (wanted.length > 0) {
+      await git.checkout({
+        ...this.base(),
+        ref: this.branch,
+        filepaths: wanted,
+        force: false,
+      });
+    }
+  }
+
+  /** Initialises a repo here and pushes the vault to an empty remote. */
+  async initAndPush(message: string): Promise<void> {
+    if (!(await this.isRepo())) {
+      await git.init({ ...this.base(), defaultBranch: this.branch });
+    }
+    if (!(await this.currentRemoteUrl())) {
+      await git.addRemote({ ...this.base(), remote: "origin", url: this.url });
+    }
+    await this.commitLocal(message);
+    await git.push({
+      ...this.net(),
+      ref: this.branch,
+      remoteRef: this.branch,
+    });
+    this.log("init: pushed initial commit");
+  }
+
+  /** Fetches into the remote-tracking ref. Writes nothing to the working tree. */
+  async fetch(): Promise<string | null> {
+    const res = await git.fetch({
+      ...this.net(),
+      ref: this.branch,
+      remoteRef: this.branch,
+      singleBranch: true,
+      tags: false,
+    });
+    const oid = res.fetchHead ?? (await this.tryResolve(`refs/remotes/origin/${this.branch}`));
+    this.log(`fetch: remote head ${oid ? oid.slice(0, 7) : "none"}`);
+    return oid;
+  }
+
+  /** Pushes only when local is genuinely ahead. Returns whether it pushed. */
+  async push(): Promise<boolean> {
+    const local = await this.tryResolve(`refs/heads/${this.branch}`);
+    const remote = await this.tryResolve(`refs/remotes/origin/${this.branch}`);
+    if (!local) {
+      this.log("push: no local branch, skipping");
+      return false;
+    }
+    if (local === remote) {
+      this.log("push: nothing to push");
+      return false;
+    }
+    await git.push({ ...this.net(), ref: this.branch, remoteRef: this.branch });
+    this.log(`push: pushed ${local.slice(0, 7)}`);
+    return true;
+  }
+
 }
 
 /**
@@ -959,4 +1080,10 @@ export function isPathAbsent(err: unknown, oid: string): boolean {
   // routes to `unreadable`, which refuses rather than deletes.
   if (!OID.test(oid)) return false;
   return !OID.test(e.data?.what ?? "");
+}
+
+/** Compares remote URLs ignoring a trailing .git and case. */
+function sameRepo(a: string, b: string): boolean {
+  const norm = (u: string) => u.trim().replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();
+  return norm(a) === norm(b);
 }

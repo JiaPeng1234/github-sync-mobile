@@ -3660,6 +3660,19 @@ describe("SafeGit.decideConnect", () => {
     const d = await h.safeGit.decideConnect({ remoteHasContent: true });
     expect(d.kind).toBe("reconnect");
   });
+
+  it("reconnects when the stored remote omits the trailing .git", async () => {
+    const h = await makeHarness();
+    await initRepo(h);
+    await git.addRemote({
+      fs: h.fs,
+      dir: h.dir,
+      remote: "origin",
+      url: "https://github.com/o/r",
+    });
+    const d = await h.safeGit.decideConnect({ remoteHasContent: true });
+    expect(d.kind).toBe("reconnect");
+  });
 });
 
 describe("SafeGit.push", () => {
@@ -3828,7 +3841,9 @@ function sameRepo(a: string, b: string): boolean {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/git/safe-git-connect.test.ts`
-Expected: PASS, 6 tests.
+Expected: PASS, 7 tests. (The asymmetric-`.git` reconnect test pins `sameRepo`'s
+`.git` normalization — the line that gates the re-point refusal, a data-loss-adjacent
+decision; verified with a killing mutant during the Task 11 code-quality review.)
 
 - [ ] **Step 5: Run the whole suite**
 
