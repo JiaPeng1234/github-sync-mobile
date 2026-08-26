@@ -32,14 +32,13 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**15 of 19 tasks implemented.** The entire SafeGit safety core is complete — repo state, status,
-commit, safe merge, whole-file conflict resolution, and the connect/clone/fetch/push network surface —
-all reviewed, plus a whole-module (cross-task) review that found and fixed two composition data-loss
-seams. The sync service (Task 12) orchestrates the fixed commit→fetch→merge→push sequence over
-SafeGit; the GitHub API client (Task 13) answers token/repo questions; the log modal (Task 14) and the
-whole-file conflict modal (Task 15) are built. UI Tasks 16–18 remain (settings, sync view, plugin
-entry point), plus a new small **Task 15b (RecoveryModal)** — the interrupted-checkout restore/delete
-stop-and-ask — wired in at 17/18.
+**18 of 19 tasks implemented — the plugin is now installable and phone-testable.** The SafeGit safety
+core (state, status, commit, safe merge, whole-file conflict resolution, connect/clone/fetch/push), the
+sync service (commit→fetch→merge→push), the GitHub API client, all UI pieces (log modal, conflict
+modal, recovery modal 15b, settings tab, sync view), and the plugin entry point (`src/main.ts`) are
+built and reviewed. `npm run build` produces a loadable mobile `main.js` (CJS, obsidian external, zero
+Node builtins, Buffer shimmed). Only **Task 19 (release workflow + README)** remains — NOT needed to
+sideload a dev build for testing. 197 tests; build green.
 
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
@@ -69,10 +68,10 @@ tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 | 13 GitHub API client | ✅ implemented, both reviews passed — `verifyToken`/`inspectRepo` via `requestUrl` (throw:false, res.text+JSON.parse); `size>0` for hasContent is safe (wrong direction caught by non-force push + `hasLocalContent`); PAT only in Authorization header. Task 16 owes a network-error try/catch at the caller |
 | 14 Log modal | ✅ implemented, reviewed — renders `SyncReport` into a copyable `<pre>`; `tsc`-only (no test); Copy button hardened for iOS WebView clipboard (falls back to a Notice); no PAT leak (renders raw error `.message` — see [[log-modal-shows-raw-error-messages]]) |
 | 15 Conflict modal | ✅ implemented, reviewed — whole-file keep-mine/keep-theirs, metadata-only (P0); dismiss=onAbandon, both-unreadable stays in history, no partial resolve; `tsc`-only. Design resolved with user (see §6) |
-| 15b Recovery modal | ⬜ NEW — interrupted-checkout restore/delete stop-and-ask (Restore primary); design resolved with user; wire into sync flow at Task 17/18 |
+| 15b Recovery modal | ✅ implemented, both reviews passed — `RecoveryModal` (Restore primary, Delete needs a confirming 2nd tap, dismiss inert) + read-only `SafeGit.listInterruptedCheckouts()` (real-git tested, under/over-report guards mutation-pinned). Still needs wiring into the sync flow at Task 17/18 |
 | 16 Settings tab | ✅ implemented, reviewed — token/owner/repo/exclude fields, Test connection (try/catch for offline), `.obsidian` token-leak confirm gate (fail-safe), exclude-everything + vault-coverage warnings; `tsc`-only (errors only on `../main` until Task 18) |
-| 17 Sync panel | ⬜ |
-| 18 Plugin entry point | ⬜ plan revised |
+| 17 Sync panel | ✅ implemented, reviewed — `SyncView` (`[Sync now]` + status + Advanced disclosure of verbs); pure UI calling `plugin.*`; double-tap guarded; `tsc`-only |
+| 18 Plugin entry point | ✅ implemented, both reviews passed — `src/main.ts` wires everything; RecoveryModal integrated (ambiguous-deletion → stop-and-ask); a review-caught seam (SyncService buried the refusal) fixed so the modal opens on the Sync button. `npm run build` produces a loadable mobile `main.js`. **First installable/phone-testable build.** 197 tests |
 | 19 Release workflow + README | ⬜ |
 
 Tasks 9 and 10 were the hardest and most safety-critical, and are done. Task 12 (sync service) is the
@@ -252,54 +251,32 @@ Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-an
 
 ## 6. What to do next
 
-**Tasks 5–11 are done** — the SafeGit safety core is COMPLETE — all fully reviewed (spec +
-code-quality + mutation + real-git probes), plus a whole-module (cross-task) review that found and
-fixed two composition data-loss seams. The entire SafeGit surface exists in `src/git/safe-git.ts` —
-the only module allowed to import isomorphic-git — with `isRepo`, `hasLocalContent`, `status`,
-`commitLocal`, `mergeSafe`, `resolveConflicts`, `abandonConflict`, `restoreFromHead`,
-`confirmDeletion`, `decideConnect`, `cloneSafe`, `initAndPush`, `fetch`, `push`, and module-private
-`isPathAbsent`/`sameRepo`. Every guard is reproduced against real iso-git 1.41 and mutation-pinned.
+**Tasks 1–18 are done and reviewed — the plugin is installable and phone-testable.** Only **Task 19
+(release workflow + README)** remains, and it is not needed to sideload a dev build. What exists:
+`src/git/safe-git.ts` (the whole SafeGit safety core — the only module importing isomorphic-git),
+`src/sync/sync-service.ts`, `src/github/api.ts`, `src/ui/*` (log/conflict/recovery modals, settings
+tab, sync view), and `src/main.ts` (the plugin entry point wiring it all together, incl. the
+RecoveryModal for the ambiguous-deletion stop-and-ask). 197 tests; `npm run build` produces a loadable
+mobile `main.js`.
 
-**Task 12 (sync service) is done too** — `src/sync/sync-service.ts` orchestrates commit→fetch→merge→push
-over the injected SafeGit and honors both seams (a thrown `commitLocal` STOPs the sequence rather than
-being forced past; no conflict is cached/replayed — each sync re-derives from a fresh `mergeSafe`). A
-single-flight `running` lock refuses concurrent syncs and releases on every exit (a stuck lock would
-brick sync on iOS). Both seams and the lock are mutation-pinned.
+### How to test it on the phone (the point of this milestone)
 
-**Task 13 (GitHub API client) is done** — `src/github/api.ts` (`verifyToken`, `inspectRepo`) over
-`requestUrl` with `throw:false` and `res.text`+`JSON.parse`. `hasContent` via `size>0` is safe even
-under GitHub's async `size` lag: the only wrong direction (repo has commits but reads `size:0` →
-`init-push`) is caught by `initAndPush`'s non-force push (the server rejects a non-fast-forward loudly)
-plus `decideConnect`'s independent `hasLocalContent()` check.
+`main.js` is gitignored — you build it locally and copy three files to the vault. **Use a throwaway
+vault + a private test repo first, never the real vault.**
 
-**Task 14 (log modal) is done** — `src/ui/log-modal.ts` renders a `SyncReport` into a copyable
-`<pre>` (the only way to see a sync's result on a phone). `tsc`-only, no test. The Copy button is
-hardened against iOS-WebView clipboard being absent/rejecting. Note it renders raw error `.message`
-strings, so keep the PAT out of thrown messages — [[log-modal-shows-raw-error-messages]].
+1. `npm ci && npm run build` → produces `main.js` in the repo root.
+2. On the test vault, create the plugin folder: `<vault>/.obsidian/plugins/github-sync-mobile/`.
+3. Copy `main.js`, `manifest.json`, and (if present) `styles.css` into that folder. On iOS, get them
+   there however you sync files to the phone (e.g. Files app, AirDrop, or a temporary desktop sync).
+4. In Obsidian: Settings → Community plugins → enable **github-sync-mobile** (turn off Restricted/Safe
+   mode if needed).
+5. Create a **private** GitHub repo and a **fine-grained PAT** with `Contents: read and write` scoped
+   to just that repo. In the plugin's settings, fill token/owner/repo, tap **Test connection**, then
+   run **Connect this vault to GitHub** from the command palette.
+6. Open the ribbon panel, add/edit a note, tap **Sync now**. Verify the note lands on GitHub; edit on
+   GitHub and sync again to see the pull path. `.obsidian/` (and your PAT) must NOT appear in the repo.
 
-**Task 15 (conflict modal) is done too** — `src/ui/conflict-modal.ts`, whole-file keep-mine/keep-theirs
-from a `mergeSafe` conflict, metadata-only (P0). Dismiss = `onAbandon` (touches nothing); a
-both-unreadable file is skipped and stays in history; Apply cannot fire a partial/undefined-choice
-resolution (a non-decidable path can never enter the `choices` map — verified). 189 tests.
-
-**The advanced/manual-mode UX boundary was designed WITH the user (2026-08-26) and is now RESOLVED in
-the plan** (Task 15/15b/17 headers). The decisions: conflict detail is metadata-only for P0; the
-ambiguous interrupted-checkout restore/delete is a **separate RecoveryModal (Task 15b)** with Restore
-as the primary/safe action, wired at 17/18; the sync view (Task 17) is `[Sync now]` + a status readout,
-with manual Fetch/Merge/Commit/Push behind an "Advanced" disclosure that drops nagging but never the
-ambiguous-deletion stop-and-ask. Future work the user parked: richer/in-place conflict resolution on
-mobile (phase 2). **These are settled — no more solo-vs-ask ambiguity for 15b/17; just build to the
-resolved plan.**
-
-**Next is Task 16 (settings tab)** — `src/ui/settings-tab.ts`. It has the token/owner/repo/exclude
-fields and the connect action. Two obligations, both already in the Task 16 plan header: the explicit
-token-leak warning when un-excluding `.obsidian/` (the PAT lives in `.obsidian/plugins/<id>/data.json`
-plaintext), and a **network-error try/catch** around `verifyToken`/`inspectRepo` so an offline connect
-shows a Notice, not an unhandled rejection (the thin client lets the throw propagate — catch at the
-caller). Then Task 15b (recovery modal), Task 17 (sync view), Task 18 (`src/main.ts` — first
-installable/phone-testable build).
-
-Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
+### Load-bearing facts any future session must still carry
 
 - **`hasLocalContent` throws on a read failure** (not returns false). A transient read over a vault
   *with* notes must never look "empty" and send `decideConnect` down clone-safe (which would write the
@@ -317,43 +294,25 @@ Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
   whose heads no longer match the live refs. Do not cache and replay a conflict resolution across a
   later fetch/merge.
 
-**Task 12's sync sequence must not undo those SafeGit guards** — do not force past `commitLocal`'s
-interrupted-checkout refusal (re-run the merge/checkout instead), and re-derive conflicts from a fresh
-`mergeSafe` rather than replaying a stale resolution.
+**The sync flow must not undo those SafeGit guards** — the sync service does not force past
+`commitLocal`'s interrupted-checkout refusal; it re-throws it so `main.ts` opens the RecoveryModal
+(Restore re-materialises from HEAD, Delete commits after a confirming tap), and conflicts are always
+re-derived from a fresh `mergeSafe`, never a cached/replayed resolution. The shared predicate
+`isInterruptedCheckoutRefusal` (exported from `safe-git.ts`, beside the throw) is what routes the
+refusal; a test pins it against the real thrown error so the regex can't drift.
 
-**Advanced/manual mode boundary (user, 2026-08-26; design WITH them at Task 15/17):** the primary path
-is one Sync button; manual Fetch/Merge/Commit/Push buttons should feel like a laptop git CLI (drop
-convenience nagging) but must NOT drop the stop-and-ask on the ambiguous `[1,0,0]` deletion — that is a
-data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *timing*, not *whether
-data can be lost silently*. Plan notes are on Task 15 and Task 17.
+**Advanced/manual-mode boundary — RESOLVED with the user** ([[advanced-mode-boundary]], and the
+Task 15/15b/17 plan headers): `[Sync now]` + status; manual verbs behind an "Advanced" disclosure that
+drops convenience nagging but never the ambiguous-`[1,0,0]`-deletion stop-and-ask (a data-loss
+decision; iOS has no CLI to undo). Manual controls *timing*, not *whether data can be lost silently*.
 
-**Minimum phone-testable version: after Task 18** (creates `src/main.ts`, the first build that
-installs). Tasks 16→18 (plus 15b) remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
-against a throwaway vault + a private test repo before the real vault.
+**Next: Task 19 (release workflow + README)** — `.github/workflows/release.yml` (tag → build → attach
+`main.js`+`manifest.json` to a GitHub release) and `README.md`. Its plan section has the full content.
+Not needed to sideload for personal testing. Its checklist ends with manual testing on the author's
+iPhone — the final gate; a green suite is not shipping confidence.
 
 **All subagents run on Opus** (user, 2026-08-26) — implementers included, superseding §3's "implementers
 on Sonnet" line below.
-
-**Tasks 11–15 are done.** Task 11 (`decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`):
-`decideConnect` lets `hasLocalContent()`'s read-failure throw propagate, and `cloneSafe` keeps excluded
-paths off disk with `force:false`, preserving user edits even after an interrupted checkout. Task 12
-(`SyncService`): orchestrates commit→fetch→merge→push, honoring both seams; single-flight lock releases
-on every exit. Task 13 (`GitHubApi`): `verifyToken`/`inspectRepo` over `requestUrl`; `size>0` for
-hasContent is safe (wrong direction caught by non-force push + local-content check). Task 14
-(`LogModal`) and Task 15 (`ConflictModal`) are built; both `tsc`-only.
-
-**Next is Task 16, the settings tab** (`src/ui/settings-tab.ts`) — token/owner/repo/exclude fields and
-the connect action. Two obligations in its plan header: the token-leak warning on un-excluding
-`.obsidian/`, and a network-error try/catch around `verifyToken`/`inspectRepo` (offline connect → Notice,
-not unhandled rejection). UI tasks are verified by `npx tsc --noEmit` only. §4's `noImplicitOverride`
-applies to `PluginSettingTab.display` (needs `override`). The advanced-mode UX is now fully resolved in
-the plan (Task 15b + 17 headers) — build to it; no further design questions are open there.
-
-**Then Tasks 13 → 19:** the GitHub API client (13), and the UI (log modal 14, conflict
-modal 15, settings tab 16, sync view 17, plugin entry point 18, release workflow 19). **Task 18 is the
-first time `src/main.ts` exists and `npm run build` can succeed — and the first installable build, so
-it is the minimum phone-testable milestone.** Task 19 ends with manual testing on the author's iPhone
-— the final gate; a green suite is not shipping confidence.
 
 ### Deferred by decision, not oversight
 

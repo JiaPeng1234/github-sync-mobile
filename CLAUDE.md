@@ -28,20 +28,19 @@ When choosing between convenient and cannot-lose-data, choose the latter.
 
 ## Status
 
-15 of 19 tasks implemented. The SafeGit safety core (`src/git/safe-git.ts`), the sync service
-(`src/sync/sync-service.ts`, commit→fetch→merge→push), the GitHub API client (`src/github/api.ts`), the
-log modal (`src/ui/log-modal.ts`), and the whole-file conflict modal (`src/ui/conflict-modal.ts`) are
-done and reviewed. The advanced-mode UX is resolved in the plan. Next is Task 16 (settings tab). See
-[docs/HANDOVER.md](docs/HANDOVER.md) §6 for exact next steps and the guards a new session must carry.
+18 of 19 tasks implemented — **the plugin is installable and phone-testable.** The SafeGit safety core
+(`src/git/safe-git.ts`), the sync service (`src/sync/sync-service.ts`), the GitHub API client
+(`src/github/api.ts`), all UI (`src/ui/*` — log/conflict/recovery modals, settings tab, sync view), and
+the plugin entry point (`src/main.ts`) are done and reviewed. `npm run build` produces a loadable mobile
+`main.js`. Only Task 19 (release workflow + README) remains — not needed to sideload a dev build. See
+[docs/HANDOVER.md](docs/HANDOVER.md) §6 for next steps and the guards a new session must carry.
 
 ```bash
 npm ci
 npx tsc --noEmit   # expect exit 0
-npx vitest run     # expect 189 passed (run a single file: npx vitest run tests/git/safe-git-merge.test.ts)
+npx vitest run     # expect 197 passed (run a single file: npx vitest run tests/git/safe-git-merge.test.ts)
+npm run build      # expect success → main.js (gitignored)
 ```
-
-`npm run build` fails until `src/main.ts` exists (Task 18) — that is expected, not a break. Task 18 is
-also the first installable build (the minimum phone-testable milestone).
 
 ## Conventions
 
