@@ -4471,22 +4471,28 @@ git commit -m "feat: on-screen log modal for mobile diagnostics"
 
 ## Task 15: Conflict modal
 
-> **To design WITH the user when this task starts (noted 2026-08-26):** SafeGit exposes
-> `restoreFromHead(paths)` and `confirmDeletion(paths, message)` as the two resolutions for the
-> ambiguous interrupted-checkout state (`commitLocal` throws `/ambiguous, resolvable/i`). The conflict
-> modal is the natural place to surface that choice: "these files are in history but not on disk —
-> did you delete them (confirm), or was a sync interrupted (restore)?" These methods are the
-> advanced-operation backend the modal drives.
+> **Design resolved WITH the user (2026-08-26). Decisions:**
 >
-> **Open design point the user raised — resolve it here, do NOT silently decide it:** the user wants
-> advanced/manual git operations (fetch, merge, etc.) to feel like a laptop git CLI rather than
-> nagging with confirmations. Agreed for *convenience* checks. But the interrupted-checkout ambiguity
-> is NOT a convenience check — the two interpretations lead to opposite outcomes (keep the remote file
-> vs. delete it) and on iOS there is no CLI to undo a wrong guess. A laptop CLI can skip the prompt
-> because the user can `git reset`; the phone user cannot. So the boundary to agree with the user:
-> advanced mode may drop client-side *confirmation nagging*, but must NOT drop the
-> stop-and-ask on the ambiguous `[1,0,0]` deletion, because that is a data-loss decision, not a
-> convenience one. Manual controls *when* to sync, not *whether data can be lost silently*.
+> 1. **Task 15 scope is ONLY the whole-file merge-conflict modal** (the `mergeSafe` "conflict" case:
+>    pick "keep mine"/"keep theirs" per file). Content detail is **metadata-only for P0** — line count
+>    for text, size for binary, "unreadable"/"deleted" for the rest; no content preview. Both versions
+>    are already in history, so neither choice loses data.
+> 2. **The ambiguous interrupted-checkout stop-and-ask is a SEPARATE modal, not folded in here.** It is
+>    a different flow (files in history but missing on disk — restore vs. delete) with a different
+>    SafeGit backend (`restoreFromHead`/`confirmDeletion` vs. this modal's `resolveConflicts`/
+>    `abandonConflict`), and getting it wrong *commits a deletion* — so it stays single-purpose. See the
+>    new **Task 15b (RecoveryModal)** below; it is wired into the sync flow at Task 17/18, at the point
+>    `commitLocal`'s `/ambiguous, resolvable/i` throw actually reaches the UI. Presentation the user
+>    chose: explicit stop-and-ask, **Restore is the primary/safe action**, no pre-selected default that
+>    commits a deletion.
+> 3. **Advanced/manual-mode boundary (Task 17):** advanced controls may drop convenience *nagging* to
+>    feel like a laptop CLI, but must NOT drop the ambiguous-`[1,0,0]`-deletion stop-and-ask — that is a
+>    data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *when* to sync, not
+>    *whether data can be lost silently*.
+>
+> **Future work the user asked to keep on the radar (NOT this task):** (a) improve the conflict modal's
+> detail once real conflicts are hit on the phone; (b) a way to actually *resolve* a conflict in place
+> on mobile (beyond whole-file choice) — the phase-2 line-level resolution, revisited after real use.
 
 - [ ] **Step 1: Create `src/ui/conflict-modal.ts`**
 
@@ -4554,10 +4560,17 @@ export class ConflictModal extends Modal {
       if (file.ours.state === "unreadable") mine.disabled = true;
       if (file.theirs.state === "unreadable") theirs.disabled = true;
 
+      // Bold alone is too subtle on a phone for a choice that decides which version
+      // wins, so the selected side also gets the accent background/border.
       const paint = () => {
         const c = this.choices.get(file.path);
-        mine.style.fontWeight = c === "mine" ? "700" : "400";
-        theirs.style.fontWeight = c === "theirs" ? "700" : "400";
+        for (const [btn, val] of [[mine, "mine"], [theirs, "theirs"]] as const) {
+          const on = c === val;
+          btn.style.fontWeight = on ? "700" : "400";
+          btn.style.border = on ? "2px solid var(--interactive-accent)" : "";
+          btn.style.background = on ? "var(--interactive-accent)" : "";
+          btn.style.color = on ? "var(--text-on-accent)" : "";
+        }
       };
       mine.onclick = () => { this.choices.set(file.path, "mine"); paint(); };
       theirs.onclick = () => { this.choices.set(file.path, "theirs"); paint(); };
@@ -4568,7 +4581,10 @@ export class ConflictModal extends Modal {
       (f) => !(f.ours.state === "unreadable" && f.theirs.state === "unreadable"),
     );
 
-    const apply = contentEl.createEl("button", { text: "Apply and push" });
+    // "Apply resolution", not "Apply and push": this modal only hands the choices
+    // back to the sync view, which then commits and pushes and reports that outcome.
+    // Claiming "…and push" here would lie if the later push fails.
+    const apply = contentEl.createEl("button", { text: "Apply resolution" });
     apply.style.marginTop = "6px";
     apply.onclick = () => {
       if (this.choices.size !== decidable.length) return;
@@ -4626,6 +4642,30 @@ Expected: no errors.
 git add src/ui/conflict-modal.ts
 git commit -m "feat: whole-file conflict resolution modal"
 ```
+
+---
+
+## Task 15b: Recovery modal (interrupted-checkout restore/delete)
+
+> **Added 2026-08-26 (design resolved with the user).** SafeGit's `commitLocal` throws
+> `/ambiguous, resolvable/i` when files are in HEAD but missing on disk (`[head=1, workdir=0,
+> stage=0]`) — either a sync was interrupted mid-download (→ `restoreFromHead(paths)`) or the user
+> really deleted them (→ `confirmDeletion(paths, message)`). This is a data-loss decision with no CLI
+> undo on iOS, so it is an **explicit stop-and-ask** and must NOT be auto-decided, even in advanced
+> mode. Kept as its own modal (not folded into the conflict modal) because the flow and the SafeGit
+> backend differ, and because one wrong tap here commits a deletion.
+>
+> **Presentation (user-chosen):** list the affected paths; state plainly "these are in history but
+> missing on disk — a sync may have been interrupted, or you may have deleted them"; **Restore is the
+> primary action** (safe/reversible), Delete is secondary and should carry a confirming tap before it
+> commits. No default that silently commits a deletion.
+>
+> **Wiring:** Task 17/18 catch `commitLocal`'s `/ambiguous, resolvable/i` throw out of the sync flow
+> and open this modal instead of surfacing the raw error. The modal calls `restoreFromHead` or
+> `confirmDeletion` on the same `SafeGit` instance, then re-runs the sync. `tsc`-only, no test suite
+> (DOM modal), like Tasks 14/15. The exact code is authored when this task is implemented, mirroring
+> `conflict-modal.ts`'s structure (onOpen/onClose with `override`, resolved-flag guard so dismissing
+> without choosing leaves the repo untouched — dismiss = do nothing, NOT delete).
 
 ---
 
@@ -4899,16 +4939,21 @@ git commit -m "feat: settings tab with token-leak warning on .obsidian"
 
 ## Task 17: Sync view
 
-> **To design WITH the user when this task starts (noted 2026-08-26):** the primary path is a single
-> Sync button that runs the whole sequence. The user also wants **advanced/manual operations** here —
-> individual Fetch / Merge / Commit / Push buttons, each mapping to a SafeGit method (`fetch`,
-> `mergeSafe`, `commitLocal`, `push`) plus connect (`decideConnect`/`cloneSafe`). Intent: manual mode
-> should feel like a laptop git CLI, not a nag. Boundary to agree (see the matching note on Task 15):
-> manual mode controls *timing*, not *safety* — every button still runs the full guards (binary
-> pre-screen, dry-run, non-force checkout, read-failure refusal). The one thing manual mode must NOT
-> skip is the stop-and-ask on the ambiguous interrupted-checkout deletion — that is a data-loss
-> decision and iOS has no CLI to recover from a wrong guess. Discuss the exact UX (which prompts are
-> "convenience" and droppable vs. which are load-bearing) with the user before building.
+> **Design resolved WITH the user (2026-08-26):**
+> - **Primary view:** a single **`[Sync now]`** button that runs the whole sequence, with a **status
+>   readout beside it** (e.g. last sync result / ahead-behind / "up to date" — surface `SyncReport`
+>   step summaries and/or `status()`'s ahead/behind so the user sees state at a glance without opening
+>   the log modal).
+> - **Advanced/manual controls behind a disclosure** (collapsed by default) in this same view:
+>   individual Fetch / Merge / Commit / Push buttons, each mapping to a SafeGit method (`fetch`,
+>   `mergeSafe`, `commitLocal`, `push`) plus connect (`decideConnect`/`cloneSafe`). Advanced buttons
+>   **drop convenience nagging** to feel like a laptop CLI.
+> - **The non-negotiable:** manual mode controls *timing*, not *safety*. Every button still runs the
+>   full SafeGit guards (binary pre-screen, dry-run, non-force checkout, read-failure refusal), and the
+>   ambiguous interrupted-checkout deletion still opens the **RecoveryModal (Task 15b)** stop-and-ask —
+>   it is a data-loss decision, not a convenience prompt, and iOS has no CLI to undo a wrong guess.
+> - **Wiring obligation:** this view (with Task 18) is where `commitLocal`'s `/ambiguous, resolvable/i`
+>   throw is caught and routed to the RecoveryModal rather than surfaced as a raw failed-commit line.
 
 - [ ] **Step 1: Create `src/ui/sync-view.ts`**
 
