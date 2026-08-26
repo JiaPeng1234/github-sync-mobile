@@ -71,7 +71,7 @@ Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut the
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 162 passed
+npx vitest run       # expect 166 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -270,13 +270,28 @@ deletes on `absent` — was verified correct against real git's four error shape
 
 Two cross-method seams were found by the holistic review and are now guarded inside SafeGit —
 **Task 12's sync sequence must not undo them:**
-- `commitLocal` refuses a `[head=1, workdir=0, stage=0]` row (an interrupted fast-forward left a
-  remote-added file un-materialised; committing its "deletion" would destroy it on the remote). If
-  the sync loop ever sees that refusal, the right recovery is to re-run the merge/checkout, not to
-  force past it.
+- `commitLocal` refuses a `[head=1, workdir=0, stage=0]` row (an interrupted fast-forward/merge left a
+  remote-added file un-materialised; committing its "deletion" would destroy it on the remote). This
+  refusal is now **resolvable, not terminal**: `restoreFromHead(paths)` re-materialises the file from
+  HEAD (the "interrupted download" case), and `confirmDeletion(paths, message)` commits the deletion
+  once the user confirms it (the "yes I deleted it" case, keeping the read-failure guard). These two
+  are the advanced-operation backend the conflict modal / sync view (Task 15/17) will drive.
 - `mergeSafe` clears `pending` on non-conflict exits and `resolveConflicts` refuses a `pending` whose
   heads no longer match the live refs. The sync service / conflict modal must not cache and replay a
   stale conflict resolution.
+
+**Advanced/manual mode boundary (user, 2026-08-26; design WITH them at Task 15/17):** the primary path
+is one Sync button; manual Fetch/Merge/Commit/Push buttons should feel like a laptop git CLI (drop
+convenience nagging) but must NOT drop the stop-and-ask on the ambiguous `[1,0,0]` deletion — that is a
+data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *timing*, not *whether
+data can be lost silently*. Plan notes are on Task 15 and Task 17.
+
+**Minimum phone-testable version: after Task 18** (creates `src/main.ts`, the first build that
+installs). Tasks 11→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
+against a throwaway vault + a private test repo before the real vault.
+
+**All subagents run on Opus** (user, 2026-08-26) — implementers included, superseding §3's "implementers
+on Sonnet" line below.
 
 **Start with Task 11, SafeGit: connect decision, clone-safe, fetch, push** — the LAST SafeGit task.
 It adds `decideConnect`, `cloneSafe`, `fetch`, `push`. Its carried obligation (from the Task 7

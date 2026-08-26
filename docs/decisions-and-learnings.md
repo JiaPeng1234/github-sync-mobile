@@ -597,6 +597,29 @@ one holistic pass looking only at composition — app-kill windows, shared mutab
 whether a read/deletion path added late bypasses an early guard — was worth more than another round on
 any single method.
 
+### When two states are indistinguishable, don't guess — make it resolvable
+
+The first fix for the interrupted-fast-forward seam refused every `[head=1, workdir=0, stage=0]`
+deletion. That was safe from data loss but too broad: a *genuine* user deletion, if the app is killed
+between `commitLocal`'s `git.remove` and its `git.commit`, re-presents as the identical `[1,0,0]`
+shape — so the guard refused it forever, and on iOS there is no git CLI to repair it. Trading a
+data-loss bug for a permanent-stranding bug is not a win.
+
+We probed hard for a discriminator and found none: after the fact, an interrupted *incoming* checkout
+and an interrupted *outgoing* deletion are genuinely indistinguishable by git alone — `resetIndex`
+collapses both to `[1,0,1]`, and both still show the file in the remote-tracking tree. git simply does
+not record *why* the index and disk disagree.
+
+So the resolution was not a cleverer guess but a structural one: keep `commitLocal`'s default a refusal
+(never lose data, never improvise), but make the refused state *resolvable* rather than terminal. Two
+escape hatches on SafeGit, for a later UI to drive: `restoreFromHead(paths)` re-materialises the file
+from history (the "not mine — an interrupted download" case, repairing the checkout the plugin itself
+failed to finish — the user can't `git pull` on a phone, so the plugin redoes it), and
+`confirmDeletion(paths, message)` completes the deletion once the user confirms it (the "yes, I deleted
+it" case), while keeping the `stillOnDisk` read-failure guard so a present file is never removed. The
+principle: when a safe default would strand the user and the ambiguity can't be resolved by inspection,
+resolve it by *asking* — surface a structured choice, don't pick one and hope.
+
 ### The deletion discriminator was verified against reality, not its own tests
 
 Resolution deletes a file (unlink + commit) when the chosen side is `absent`, and a side is `absent`

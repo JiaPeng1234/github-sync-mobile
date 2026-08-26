@@ -4398,8 +4398,22 @@ git commit -m "feat: on-screen log modal for mobile diagnostics"
 
 ## Task 15: Conflict modal
 
-**Files:**
-- Create: `src/ui/conflict-modal.ts`
+> **To design WITH the user when this task starts (noted 2026-08-26):** SafeGit exposes
+> `restoreFromHead(paths)` and `confirmDeletion(paths, message)` as the two resolutions for the
+> ambiguous interrupted-checkout state (`commitLocal` throws `/ambiguous, resolvable/i`). The conflict
+> modal is the natural place to surface that choice: "these files are in history but not on disk —
+> did you delete them (confirm), or was a sync interrupted (restore)?" These methods are the
+> advanced-operation backend the modal drives.
+>
+> **Open design point the user raised — resolve it here, do NOT silently decide it:** the user wants
+> advanced/manual git operations (fetch, merge, etc.) to feel like a laptop git CLI rather than
+> nagging with confirmations. Agreed for *convenience* checks. But the interrupted-checkout ambiguity
+> is NOT a convenience check — the two interpretations lead to opposite outcomes (keep the remote file
+> vs. delete it) and on iOS there is no CLI to undo a wrong guess. A laptop CLI can skip the prompt
+> because the user can `git reset`; the phone user cannot. So the boundary to agree with the user:
+> advanced mode may drop client-side *confirmation nagging*, but must NOT drop the
+> stop-and-ask on the ambiguous `[1,0,0]` deletion, because that is a data-loss decision, not a
+> convenience one. Manual controls *when* to sync, not *whether data can be lost silently*.
 
 - [ ] **Step 1: Create `src/ui/conflict-modal.ts`**
 
@@ -4803,8 +4817,16 @@ git commit -m "feat: settings tab with token-leak warning on .obsidian"
 
 ## Task 17: Sync view
 
-**Files:**
-- Create: `src/ui/sync-view.ts`
+> **To design WITH the user when this task starts (noted 2026-08-26):** the primary path is a single
+> Sync button that runs the whole sequence. The user also wants **advanced/manual operations** here —
+> individual Fetch / Merge / Commit / Push buttons, each mapping to a SafeGit method (`fetch`,
+> `mergeSafe`, `commitLocal`, `push`) plus connect (`decideConnect`/`cloneSafe`). Intent: manual mode
+> should feel like a laptop git CLI, not a nag. Boundary to agree (see the matching note on Task 15):
+> manual mode controls *timing*, not *safety* — every button still runs the full guards (binary
+> pre-screen, dry-run, non-force checkout, read-failure refusal). The one thing manual mode must NOT
+> skip is the stop-and-ask on the ambiguous interrupted-checkout deletion — that is a data-loss
+> decision and iOS has no CLI to recover from a wrong guess. Discuss the exact UX (which prompts are
+> "convenience" and droppable vs. which are load-bearing) with the user before building.
 
 - [ ] **Step 1: Create `src/ui/sync-view.ts`**
 
