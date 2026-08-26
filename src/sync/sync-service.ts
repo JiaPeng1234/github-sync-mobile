@@ -1,4 +1,4 @@
-import type { SafeGit } from "../git/safe-git";
+import { isInterruptedCheckoutRefusal, type SafeGit } from "../git/safe-git";
 import type {
   ConflictFile,
   SyncReport,
@@ -49,6 +49,13 @@ export class SyncService {
           detail: committed ? `committed ${oid!.slice(0, 7)}` : "nothing to commit",
         });
       } catch (err) {
+        // The ambiguous interrupted-checkout refusal is NOT a sync failure to bury in a
+        // report — it is a data-loss decision the user must make. Re-throw it so the
+        // caller (the plugin) can open the RecoveryModal stop-and-ask; if it were only
+        // recorded in a step's detail, the primary Sync button would show a raw error and
+        // the recovery UI would never appear. Every other commit failure is a normal
+        // failed step that stops the sequence.
+        if (isInterruptedCheckoutRefusal(err)) throw err;
         steps.push({ name: "commit", result: "failed", detail: message(err) });
         return this.finish(steps, conflicts, logs);
       }

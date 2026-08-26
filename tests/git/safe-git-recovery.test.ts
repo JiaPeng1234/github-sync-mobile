@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import git from "isomorphic-git";
+import { isInterruptedCheckoutRefusal } from "../../src/git/safe-git";
 import { makeHarness, initRepo, divergeRemote } from "../helpers/repo";
 
 /**
@@ -55,6 +56,24 @@ describe("SafeGit.listInterruptedCheckouts", () => {
     await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/ambiguous, resolvable/i);
 
     expect(await h.safeGit.listInterruptedCheckouts()).toEqual(["notes/c.md"]);
+  });
+
+  it("isInterruptedCheckoutRefusal matches commitLocal's REAL throw", async () => {
+    // Pin the shared predicate against the actual error object commitLocal throws — not a
+    // hand-written copy of the message. If the throw text ever drifts out of the regex, the
+    // sync service would stop re-throwing it and the RecoveryModal would silently never open.
+    const h = await interruptedFastForward("notes/c.md", "remote c\n");
+    let caught: unknown;
+    try {
+      await h.safeGit.commitLocal("sync");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(isInterruptedCheckoutRefusal(caught)).toBe(true);
+    // And it must NOT match unrelated errors.
+    expect(isInterruptedCheckoutRefusal(new Error("network offline"))).toBe(false);
+    expect(isInterruptedCheckoutRefusal("not an error")).toBe(false);
   });
 
   it("returns every ambiguous path when several were left unmaterialised", async () => {

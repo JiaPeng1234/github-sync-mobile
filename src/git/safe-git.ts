@@ -9,6 +9,20 @@ function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * True when `err` is `commitLocal`'s ambiguous interrupted-checkout refusal — a
+ * `[head=1, workdir=0, stage=0]` path that is EITHER an interrupted download OR a real
+ * deletion. This is a data-loss decision the user must make, never a normal failure, so
+ * callers route it to the recovery stop-and-ask instead of surfacing it as an error.
+ *
+ * Lives here, beside the throw it matches (see `commitLocal`), so the message and its
+ * detector cannot drift apart. Both the sync service (which must re-throw it rather than
+ * bury it in a report) and the plugin (which opens the RecoveryModal) key on this.
+ */
+export function isInterruptedCheckoutRefusal(err: unknown): boolean {
+  return err instanceof Error && /ambiguous, resolvable/i.test(err.message);
+}
+
 interface ThreeWayRow {
   path: string;
   baseOid: string | null;

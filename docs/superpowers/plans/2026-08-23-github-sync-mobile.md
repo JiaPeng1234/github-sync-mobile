@@ -4045,7 +4045,7 @@ Expected: FAIL — cannot resolve `../../src/sync/sync-service`.
 - [ ] **Step 3: Create `src/sync/sync-service.ts`**
 
 ```ts
-import type { SafeGit } from "../git/safe-git";
+import { isInterruptedCheckoutRefusal, type SafeGit } from "../git/safe-git";
 import type {
   ConflictFile,
   SyncReport,
@@ -4096,6 +4096,13 @@ export class SyncService {
           detail: committed ? `committed ${oid!.slice(0, 7)}` : "nothing to commit",
         });
       } catch (err) {
+        // The ambiguous interrupted-checkout refusal is NOT a sync failure to bury in a
+        // report — it is a data-loss decision the user must make. Re-throw it so the
+        // caller (the plugin) can open the RecoveryModal stop-and-ask; if it were only
+        // recorded in a step's detail, the primary Sync button would show a raw error and
+        // the recovery UI would never appear. Every other commit failure is a normal
+        // failed step that stops the sequence. (Added in the Task 18 review, 2026-08-27.)
+        if (isInterruptedCheckoutRefusal(err)) throw err;
         steps.push({ name: "commit", result: "failed", detail: message(err) });
         return this.finish(steps, conflicts, logs);
       }
@@ -5454,6 +5461,29 @@ export default class GitHubSyncPlugin extends Plugin {
   }
 }
 ```
+
+> **Implemented 2026-08-27 with two additions the code block above predates (both reviewed):**
+>
+> 1. **RecoveryModal wiring (the resolved advanced-mode design).** `commitLocal`'s ambiguous
+>    interrupted-checkout refusal must open the RecoveryModal (Restore-primary / Delete-with-confirm),
+>    NOT surface as a raw error — it is a data-loss decision. Added: `import { RecoveryModal }`; a
+>    private `openRecovery(git, retry)` that lists paths via `listInterruptedCheckouts()` and opens the
+>    modal (Restore → `restoreFromHead`, Delete → `confirmDeletion`); a private `recover(git, retry,
+>    action, okMessage)` that runs the chosen action then re-runs the original op; and routing in
+>    `runSync` and `runCommit`'s catches via the shared `isInterruptedCheckoutRefusal(err)` predicate
+>    (exported from `safe-git.ts`, beside the throw it matches). `runPull` is deliberately NOT wired —
+>    `mergeSafe` never calls `commitLocal`, so it cannot emit that refusal. The recover→retry loop
+>    terminates: after Restore the row is `[1,1,1]` (commitLocal skips it); after Delete it is committed;
+>    a failed recovery action is a dead-end (no retry), never a loop.
+> 2. **The seam fix (Task 18 safety review, 2026-08-27).** `SyncService.sync` originally CAUGHT the
+>    refusal and buried it in a failed commit step, so `runSync`'s catch never saw it and the modal
+>    never opened on the primary Sync button. Fixed by having `SyncService` **re-throw** the refusal
+>    (see the Task 12 block above) so `runSync` routes it to `openRecovery`. Pinned by tests: SyncService
+>    re-throws it (not a buried step), and `isInterruptedCheckoutRefusal` matches `commitLocal`'s REAL
+>    thrown error object (so the regex can't silently drift).
+>
+> One forced modifier: `override settings` (Obsidian's `Plugin` declares `settings?`, and
+> `noImplicitOverride` is on). Test count after Task 18: **197**.
 
 - [ ] **Step 2: Typecheck the whole project**
 

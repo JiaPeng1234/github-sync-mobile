@@ -106,6 +106,27 @@ describe("SyncService.sync", () => {
     expect(report.success).toBe(false);
   });
 
+  it("re-throws the interrupted-checkout refusal instead of burying it in the report", async () => {
+    // The [head=1,workdir=0,stage=0] ambiguity is a data-loss decision, not a sync
+    // failure. If the service swallowed it into a failed commit step, the plugin's Sync
+    // button would show a raw error and the RecoveryModal stop-and-ask would never open.
+    // So it must propagate out of sync() for the caller to route to recovery.
+    const g = fakeGit({
+      commitLocal: vi.fn(async () => {
+        throw new Error(
+          "notes/a.md is in the committed history but is not on this device right now. " +
+            "This is an AMBIGUOUS, RESOLVABLE state that cannot be decided automatically.",
+        );
+      }),
+    });
+    await expect(new SyncService(g as never, () => "msg").sync()).rejects.toThrow(
+      /ambiguous, resolvable/i,
+    );
+    // It must not have proceeded past commit.
+    expect(g.fetch).not.toHaveBeenCalled();
+    expect(g.push).not.toHaveBeenCalled();
+  });
+
   it("marks commit as skipped when there was nothing to commit", async () => {
     const g = fakeGit({ commitLocal: vi.fn(async () => null) });
     const report = await new SyncService(g as never, () => "msg").sync();
