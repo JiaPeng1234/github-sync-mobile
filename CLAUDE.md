@@ -28,10 +28,10 @@ When choosing between convenient and cannot-lose-data, choose the latter.
 
 ## Status
 
-14 of 19 tasks implemented. The SafeGit safety core (`src/git/safe-git.ts`), the sync service
-(`src/sync/sync-service.ts`, commit→fetch→merge→push), the GitHub API client (`src/github/api.ts`), and
-the log modal (`src/ui/log-modal.ts`) are done and reviewed. Next is Task 15 (conflict modal) — which
-needs a UX design conversation with the user first (the advanced-mode boundary). See
+15 of 19 tasks implemented. The SafeGit safety core (`src/git/safe-git.ts`), the sync service
+(`src/sync/sync-service.ts`, commit→fetch→merge→push), the GitHub API client (`src/github/api.ts`), the
+log modal (`src/ui/log-modal.ts`), and the whole-file conflict modal (`src/ui/conflict-modal.ts`) are
+done and reviewed. The advanced-mode UX is resolved in the plan. Next is Task 16 (settings tab). See
 [docs/HANDOVER.md](docs/HANDOVER.md) §6 for exact next steps and the guards a new session must carry.
 
 ```bash

@@ -32,13 +32,14 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**14 of 19 tasks implemented.** The entire SafeGit safety core is complete — repo state, status,
+**15 of 19 tasks implemented.** The entire SafeGit safety core is complete — repo state, status,
 commit, safe merge, whole-file conflict resolution, and the connect/clone/fetch/push network surface —
 all reviewed, plus a whole-module (cross-task) review that found and fixed two composition data-loss
 seams. The sync service (Task 12) orchestrates the fixed commit→fetch→merge→push sequence over
-SafeGit, honoring both seams; the GitHub API client (Task 13) answers token/repo questions; and the
-log modal (Task 14) is the first UI piece. UI Tasks 15–18 remain (conflict modal, settings, sync view,
-plugin entry point).
+SafeGit; the GitHub API client (Task 13) answers token/repo questions; the log modal (Task 14) and the
+whole-file conflict modal (Task 15) are built. UI Tasks 16–18 remain (settings, sync view, plugin
+entry point), plus a new small **Task 15b (RecoveryModal)** — the interrupted-checkout restore/delete
+stop-and-ask — wired in at 17/18.
 
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
@@ -67,7 +68,8 @@ tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 | 12 Sync service | ✅ implemented, both reviews passed — orchestrates commit→fetch→merge→push over injected SafeGit; both cross-method seams honored (thrown-commit STOP, no conflict replay); single-flight lock; seams + lock mutation-pinned |
 | 13 GitHub API client | ✅ implemented, both reviews passed — `verifyToken`/`inspectRepo` via `requestUrl` (throw:false, res.text+JSON.parse); `size>0` for hasContent is safe (wrong direction caught by non-force push + `hasLocalContent`); PAT only in Authorization header. Task 16 owes a network-error try/catch at the caller |
 | 14 Log modal | ✅ implemented, reviewed — renders `SyncReport` into a copyable `<pre>`; `tsc`-only (no test); Copy button hardened for iOS WebView clipboard (falls back to a Notice); no PAT leak (renders raw error `.message` — see [[log-modal-shows-raw-error-messages]]) |
-| 15 Conflict modal | ⬜ plan revised — binary/unreadable rendering |
+| 15 Conflict modal | ✅ implemented, reviewed — whole-file keep-mine/keep-theirs, metadata-only (P0); dismiss=onAbandon, both-unreadable stays in history, no partial resolve; `tsc`-only. Design resolved with user (see §6) |
+| 15b Recovery modal | ⬜ NEW — interrupted-checkout restore/delete stop-and-ask (Restore primary); design resolved with user; wire into sync flow at Task 17/18 |
 | 16 Settings tab | ⬜ plan revised — exclude-everything warning + vault coverage readout |
 | 17 Sync panel | ⬜ |
 | 18 Plugin entry point | ⬜ plan revised |
@@ -270,26 +272,32 @@ under GitHub's async `size` lag: the only wrong direction (repo has commits but 
 `init-push`) is caught by `initAndPush`'s non-force push (the server rejects a non-fast-forward loudly)
 plus `decideConnect`'s independent `hasLocalContent()` check.
 
-**Task 14 (log modal) is done too** — `src/ui/log-modal.ts` renders a `SyncReport` into a copyable
+**Task 14 (log modal) is done** — `src/ui/log-modal.ts` renders a `SyncReport` into a copyable
 `<pre>` (the only way to see a sync's result on a phone). `tsc`-only, no test. The Copy button is
 hardened against iOS-WebView clipboard being absent/rejecting. Note it renders raw error `.message`
-strings, so keep the PAT out of thrown messages — [[log-modal-shows-raw-error-messages]]. 189 tests.
+strings, so keep the PAT out of thrown messages — [[log-modal-shows-raw-error-messages]].
 
-**⚠️ Next is Task 15 (the conflict modal) — STOP AND DESIGN WITH THE USER FIRST.** This is the task the
-user flagged (2026-08-26) as needing their input before implementing: the **advanced/manual-mode UX
-boundary** lives here (and in Task 17). The rule the user set: manual/advanced git controls may drop
-convenience *nagging* to feel like a laptop CLI, but must NOT drop the stop-and-ask on the ambiguous
-`[1,0,0]` interrupted-checkout deletion — that is a data-loss decision and iOS has no CLI to undo a
-wrong guess. The conflict modal is also where `restoreFromHead`/`confirmDeletion` (the two resolutions
-for that ambiguous state) get surfaced. **Do not implement Task 15 solo — raise the UX questions with
-the user first** (see the Task 15 plan header, which spells out the open design point). Carried
-obligation for when it is built: it must NOT cache and replay a conflict — re-derive from a fresh
-`mergeSafe` after any later fetch/merge.
+**Task 15 (conflict modal) is done too** — `src/ui/conflict-modal.ts`, whole-file keep-mine/keep-theirs
+from a `mergeSafe` conflict, metadata-only (P0). Dismiss = `onAbandon` (touches nothing); a
+both-unreadable file is skipped and stays in history; Apply cannot fire a partial/undefined-choice
+resolution (a non-decidable path can never enter the `choices` map — verified). 189 tests.
 
-**Task 16 (settings tab) owes a network-error try/catch** around `verifyToken`/`inspectRepo` in its
-connect action (the thin client lets a network throw propagate; catch it at the caller and show a
-Notice) — recorded in the Task 16 plan header. Then Task 17 (sync view — also touches the advanced-mode
-boundary) and Task 18 (`src/main.ts`, first installable/phone-testable build).
+**The advanced/manual-mode UX boundary was designed WITH the user (2026-08-26) and is now RESOLVED in
+the plan** (Task 15/15b/17 headers). The decisions: conflict detail is metadata-only for P0; the
+ambiguous interrupted-checkout restore/delete is a **separate RecoveryModal (Task 15b)** with Restore
+as the primary/safe action, wired at 17/18; the sync view (Task 17) is `[Sync now]` + a status readout,
+with manual Fetch/Merge/Commit/Push behind an "Advanced" disclosure that drops nagging but never the
+ambiguous-deletion stop-and-ask. Future work the user parked: richer/in-place conflict resolution on
+mobile (phase 2). **These are settled — no more solo-vs-ask ambiguity for 15b/17; just build to the
+resolved plan.**
+
+**Next is Task 16 (settings tab)** — `src/ui/settings-tab.ts`. It has the token/owner/repo/exclude
+fields and the connect action. Two obligations, both already in the Task 16 plan header: the explicit
+token-leak warning when un-excluding `.obsidian/` (the PAT lives in `.obsidian/plugins/<id>/data.json`
+plaintext), and a **network-error try/catch** around `verifyToken`/`inspectRepo` so an offline connect
+shows a Notice, not an unhandled rejection (the thin client lets the throw propagate — catch at the
+caller). Then Task 15b (recovery modal), Task 17 (sync view), Task 18 (`src/main.ts` — first
+installable/phone-testable build).
 
 Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
 
@@ -320,28 +328,26 @@ data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *ti
 data can be lost silently*. Plan notes are on Task 15 and Task 17.
 
 **Minimum phone-testable version: after Task 18** (creates `src/main.ts`, the first build that
-installs). Tasks 15→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
+installs). Tasks 16→18 (plus 15b) remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
 against a throwaway vault + a private test repo before the real vault.
 
 **All subagents run on Opus** (user, 2026-08-26) — implementers included, superseding §3's "implementers
 on Sonnet" line below.
 
-**Tasks 11–14 are done.** Task 11 (`decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`):
-`decideConnect` lets `hasLocalContent()`'s read-failure throw propagate (probed), and `cloneSafe` keeps
-excluded paths off disk with `force:false`, preserving user edits even after an interrupted checkout.
-Task 12 (`SyncService`): orchestrates commit→fetch→merge→push, honoring both seams; single-flight lock
-releases on every exit. Task 13 (`GitHubApi`): `verifyToken`/`inspectRepo` over `requestUrl`; `size>0`
-for hasContent is safe (wrong direction caught by non-force push + local-content check); PAT only in the
-Authorization header. Task 14 (`LogModal`): renders a `SyncReport`; iOS-clipboard-hardened; renders raw
-error `.message` so keep the PAT out of thrown messages.
+**Tasks 11–15 are done.** Task 11 (`decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`):
+`decideConnect` lets `hasLocalContent()`'s read-failure throw propagate, and `cloneSafe` keeps excluded
+paths off disk with `force:false`, preserving user edits even after an interrupted checkout. Task 12
+(`SyncService`): orchestrates commit→fetch→merge→push, honoring both seams; single-flight lock releases
+on every exit. Task 13 (`GitHubApi`): `verifyToken`/`inspectRepo` over `requestUrl`; `size>0` for
+hasContent is safe (wrong direction caught by non-force push + local-content check). Task 14
+(`LogModal`) and Task 15 (`ConflictModal`) are built; both `tsc`-only.
 
-**Next is Task 15, the conflict modal — but STOP AND DESIGN WITH THE USER FIRST** (see the ⚠️ note in
-§6 above). This is where the advanced/manual-mode UX boundary lives, which the user explicitly asked to
-design together. UI tasks are verified by `npx tsc --noEmit` only (no test suite for the DOM modals).
-Once the UX is agreed: **Task 15** must NOT cache and replay a conflict — re-derive from a fresh
-`mergeSafe`; **Task 16** (settings tab) must wrap `verifyToken`/`inspectRepo` in try/catch so an offline
-connect shows a Notice, not an unhandled rejection. §4's `noImplicitOverride` rule applies to modal
-lifecycle methods (`onOpen`/`onClose` need `override`).
+**Next is Task 16, the settings tab** (`src/ui/settings-tab.ts`) — token/owner/repo/exclude fields and
+the connect action. Two obligations in its plan header: the token-leak warning on un-excluding
+`.obsidian/`, and a network-error try/catch around `verifyToken`/`inspectRepo` (offline connect → Notice,
+not unhandled rejection). UI tasks are verified by `npx tsc --noEmit` only. §4's `noImplicitOverride`
+applies to `PluginSettingTab.display` (needs `override`). The advanced-mode UX is now fully resolved in
+the plan (Task 15b + 17 headers) — build to it; no further design questions are open there.
 
 **Then Tasks 13 → 19:** the GitHub API client (13), and the UI (log modal 14, conflict
 modal 15, settings tab 16, sync view 17, plugin entry point 18, release workflow 19). **Task 18 is the
