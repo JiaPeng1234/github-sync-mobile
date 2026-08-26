@@ -272,9 +272,13 @@ export class SafeGit {
         // Verified against real isomorphic-git 1.41: interrupted ff → [1,0,0]; real delete → [1,0,1].
         if (head === 1 && stage === 0) {
           throw new Error(
-            `${filepath} is in the committed history but was never written to this device ` +
-              `(an earlier sync was interrupted before it finished). Refusing to commit its ` +
-              `removal, which would delete it from the remote. Nothing was changed — re-run sync.`,
+            `${filepath} is in the committed history but is not on this device right now. ` +
+              `This is an AMBIGUOUS, RESOLVABLE state that cannot be decided automatically: it ` +
+              `is EITHER a deletion you intended, OR a download an earlier sync was interrupted ` +
+              `before it finished. Committing it as a removal would delete it from the remote, ` +
+              `so refusing by default — never guess, never lose data. Nothing was changed. The ` +
+              `app will offer you a choice (restore it from history, or confirm the deletion); ` +
+              `until that UI exists, restore the file to disk and re-run sync to resolve it.`,
           );
         }
 
@@ -306,6 +310,80 @@ export class SafeGit {
       author: this.author(),
     });
     this.log(`commit: created ${oid.slice(0, 7)} (${staged} path(s))`);
+    return oid;
+  }
+
+  /**
+   * Recovery escape hatch for the "not mine — it was an interrupted download" case.
+   *
+   * When `commitLocal` refused a `[head=1, workdir=0, stage=0]` path because it could not
+   * tell an intended deletion from an incoming checkout the app was killed mid-way, this
+   * is the resolution for the incoming-checkout half: materialise each path back onto disk
+   * from HEAD, repairing the interrupted checkout. Afterwards the row becomes `[1,1,1]`
+   * (file back on disk and in history), so a subsequent `commitLocal` sees nothing to
+   * delete.
+   *
+   * It uses the SAME non-forcing checkout `checkoutTracked` uses (`force: false`) — never
+   * force, so it cannot clobber a file the user has since recreated at that path. If the
+   * path is now occupied on disk, checkout leaves it alone, which is safe. Excluded paths
+   * are filtered out; they are never materialised in either direction.
+   */
+  async restoreFromHead(paths: string[]): Promise<void> {
+    const wanted = this.exclude.withoutExcluded(paths);
+    if (wanted.length === 0) {
+      this.log("restore: nothing to restore (all paths excluded or empty)");
+      return;
+    }
+    await git.checkout({
+      ...this.base(),
+      ref: this.branch,
+      filepaths: wanted,
+      force: false,
+    });
+    this.log(`restore: materialised ${wanted.length} path(s) from HEAD`);
+  }
+
+  /**
+   * Recovery escape hatch for the "yes, I deleted it" case.
+   *
+   * When `commitLocal` refused a `[head=1, workdir=0, stage=0]` path, this completes the
+   * deletion the default guard blocked — but only once the user has confirmed it, so the
+   * ambiguity is resolved by a person rather than a guess. Without it, a genuinely deleted
+   * file would be uncommittable forever and the user stranded, with no git CLI on iOS to
+   * repair anything.
+   *
+   * For each path that is genuinely absent from disk, `git.remove` then commit. The
+   * `stillOnDisk` read-failure guard is NOT bypassed: a path still present on disk throws
+   * the same read-failure refusal `commitLocal` uses, because a present file being reported
+   * as deleted may be a swallowed read failure, and this must never delete a file that
+   * exists. Excluded paths are filtered out.
+   *
+   * Returns the new commit oid, or null when nothing was staged.
+   */
+  async confirmDeletion(paths: string[], message: string): Promise<string | null> {
+    let staged = 0;
+    for (const filepath of this.exclude.withoutExcluded(paths)) {
+      if (await this.stillOnDisk(filepath)) {
+        throw new Error(
+          `${filepath} is reported as deleted but is still present. Refusing to ` +
+            `commit a deletion that may be a read failure. Nothing was changed.`,
+        );
+      }
+      await git.remove({ ...this.base(), filepath });
+      staged += 1;
+    }
+
+    if (staged === 0) {
+      this.log("confirmDeletion: nothing to delete");
+      return null;
+    }
+
+    const oid = await git.commit({
+      ...this.base(),
+      message,
+      author: this.author(),
+    });
+    this.log(`confirmDeletion: committed ${oid.slice(0, 7)} (${staged} deletion(s))`);
     return oid;
   }
 

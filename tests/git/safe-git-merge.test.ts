@@ -404,10 +404,112 @@ describe("SafeGit idempotency", () => {
     expect(h.adapter.paths()).not.toContain("notes/c.md");
 
     // The resync commit must REFUSE rather than delete the still-remote-tracked file.
-    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/never written to this device/i);
+    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/ambiguous, resolvable/i);
 
     // notes/c.md is still tracked in HEAD — its deletion was not committed.
     const tracked = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
     expect(tracked).toContain("notes/c.md");
+  });
+
+  /**
+   * The escape hatch for the interrupted-INCOMING half of the ambiguous [1,0,0] state.
+   *
+   * Same interrupted fast-forward as the test above leaves notes/c.md as [head=1,
+   * workdir=0, stage=0]: HEAD tracks the remote-added file, the working tree never got it.
+   * commitLocal refuses (proven above). `restoreFromHead(["notes/c.md"])` repairs the
+   * interrupted checkout by materialising the file back onto disk from HEAD, after which a
+   * following commitLocal does NOT throw and does NOT delete it — the file is back and
+   * still tracked.
+   */
+  it("restoreFromHead recovers a remote-added file left unmaterialised by an interrupted fast-forward", async () => {
+    const h = await makeHarness();
+    const first = await initRepo(h);
+    const remoteOid = await divergeRemote(h, first, { "notes/c.md": "remote c\n" }, "remote adds c");
+
+    await git.writeRef({ fs: h.fs, dir: h.dir, ref: "refs/heads/main", value: first, force: true });
+    await git.checkout({ fs: h.fs, dir: h.dir, ref: "main", force: true });
+    if (h.adapter.paths().includes("notes/c.md")) await h.adapter.remove("notes/c.md");
+
+    const realWrite = h.adapter.write.bind(h.adapter);
+    const realWriteBinary = h.adapter.writeBinary.bind(h.adapter);
+    h.adapter.write = async (p, ...rest) => {
+      if (p.endsWith("c.md")) throw new Error("SIMULATED app kill mid-checkout");
+      return realWrite(p, ...(rest as [string]));
+    };
+    h.adapter.writeBinary = async (p, ...rest) => {
+      if (p.endsWith("c.md")) throw new Error("SIMULATED app kill mid-checkout");
+      return realWriteBinary(p, ...(rest as [ArrayBuffer]));
+    };
+    await expect(h.safeGit.mergeSafe()).rejects.toBeTruthy();
+    h.adapter.write = realWrite;
+    h.adapter.writeBinary = realWriteBinary;
+
+    // Interrupted-incoming state: ref advanced, file absent, commitLocal refuses.
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(remoteOid);
+    expect(h.adapter.paths()).not.toContain("notes/c.md");
+    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/ambiguous, resolvable/i);
+
+    // Recover: materialise the interrupted download back onto disk from HEAD.
+    await h.safeGit.restoreFromHead(["notes/c.md"]);
+    expect(await h.adapter.read("notes/c.md")).toBe("remote c\n");
+
+    // A following commitLocal now sees nothing to delete: no throw, HEAD unmoved,
+    // notes/c.md still tracked.
+    expect(await h.safeGit.commitLocal("sync")).toBeNull();
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(remoteOid);
+    const tracked = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(tracked).toContain("notes/c.md");
+  });
+
+  /**
+   * The critical regression test: the user is NOT permanently stranded on a genuine
+   * interrupted OUTGOING deletion.
+   *
+   * The user deletes notes/a.md; commitLocal's flow runs `git.remove` (stage -> 0), then
+   * the app is killed before `git.commit`. That leaves notes/a.md as [head=1, workdir=0,
+   * stage=0] — byte-identical to the interrupted-incoming case, and undecidable by git
+   * alone. commitLocal refuses by default (never guess). Then `confirmDeletion` completes
+   * the deletion the guard blocked, so the user is no longer stranded: notes/a.md is gone
+   * from the new HEAD tree.
+   */
+  it("confirmDeletion completes a genuine interrupted-outgoing deletion so the user is not stranded", async () => {
+    const h = await makeHarness();
+    await initRepo(h); // commits notes/a.md
+
+    // The user deletes notes/a.md from disk, the commit flow stages the removal
+    // (git.remove -> stage 0), then the app is killed before git.commit. Reproduce the
+    // resulting [1,0,0] state directly.
+    await h.adapter.remove("notes/a.md");
+    await git.remove({ fs: h.fs, dir: h.dir, filepath: "notes/a.md" });
+
+    // commitLocal refuses by default — the [1,0,0] row is ambiguous.
+    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/ambiguous, resolvable/i);
+    // Still tracked: nothing was committed.
+    expect(await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toContain("notes/a.md");
+
+    // The user confirms the deletion; confirmDeletion completes it.
+    const oid = await h.safeGit.confirmDeletion(["notes/a.md"], "sync");
+    expect(oid).not.toBeNull();
+    expect(await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" })).toBe(oid);
+
+    // notes/a.md is absent from the new HEAD tree — the deletion is real and durable.
+    const tracked = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(tracked).not.toContain("notes/a.md");
+  });
+
+  /**
+   * confirmDeletion must NOT bypass the read-failure safety: a path still present on disk
+   * is refused, never deleted, because a "deleted" file that is actually there may be a
+   * swallowed read failure. This is the same stance commitLocal's `stillOnDisk` guard takes.
+   */
+  it("confirmDeletion refuses to delete a path that is still present on disk", async () => {
+    const h = await makeHarness();
+    await initRepo(h); // notes/a.md is committed and still on disk
+
+    await expect(h.safeGit.confirmDeletion(["notes/a.md"], "sync")).rejects.toThrow(/still present/i);
+
+    // Nothing committed: notes/a.md still tracked.
+    const tracked = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(tracked).toContain("notes/a.md");
   });
 });
