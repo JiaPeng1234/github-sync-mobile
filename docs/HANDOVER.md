@@ -32,14 +32,19 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**5 of 19 tasks implemented.** Nothing that syncs anything exists yet — no git code, no UI. What
-exists is the toolchain, the test harness, and the shared vocabulary.
+**10 of 19 tasks implemented.** The entire SafeGit safety core exists — repo state, status, commit,
+safe merge, and whole-file conflict resolution — all reviewed, plus a whole-module (cross-task) review
+that found and fixed two composition data-loss seams. No sync service, no GitHub API client, no UI yet.
 
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
 src/constants.ts    Task 3 — defaults, TIMESTAMP_TOKEN, COMMIT_AUTHOR, repoUrl + isValidSegment
-tests/mocks/        Task 2 — obsidian stub, in-memory DataAdapter, 32 tests
-package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill for iOS
+src/git/exclude.ts     Task 4 — the exclude matcher
+src/git/fs-adapter.ts  Task 5 — DataAdapter → fs.promises bridge + readFailures channel
+src/git/http-client.ts Task 6 — git HTTP over Obsidian requestUrl
+src/git/safe-git.ts    Tasks 7-10 — the ONLY module importing isomorphic-git; all invariants
+tests/mocks/        Task 2 — obsidian stub, in-memory DataAdapter
+tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 ```
 
 | Tasks | State |
@@ -64,7 +69,8 @@ package.json etc.   Task 1 — esbuild → single CJS main.js, buffer polyfill f
 | 18 Plugin entry point | ⬜ plan revised |
 | 19 Release workflow + README | ⬜ |
 
-Tasks 9 and 10 are the hardest and the most safety-critical. Do not shortcut them.
+Tasks 9 and 10 were the hardest and most safety-critical, and are done. Task 12 (sync service) is the
+next place a mistake could compose the safe primitives unsafely — see the seam warnings in §6.
 
 ### Verify the state yourself
 
@@ -91,8 +97,9 @@ Execution follows a fixed loop per task, one task at a time:
    implementer, then the reviewer re-reviews. Repeat until approved.
 4. Commit and push. Then the next task.
 
-**Models:** reviewers and empirical-verification agents on **Opus**; implementers on Sonnet is
-adequate because the plan hands them exact code. Reviewing is where the judgment is.
+**Models: ALL subagents run on Opus** (user instruction, 2026-08-26) — implementers included, not
+just reviewers. This supersedes the earlier "implementers on Sonnet is adequate" convention. Pass
+`model: "opus"` on every Agent/Workflow dispatch for this repo.
 
 **The single most important instruction for reviewers: verify by running things, not by reading.**
 Every serious defect found so far came from a reviewer who built a probe outside the repo and
@@ -239,46 +246,34 @@ Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-an
 
 ## 6. What to do next
 
-**Task 5 is done.** Its code-quality review (2026-08-25) ran the full drill — 15 mutations, real
-isomorphic-git 1.41 probes — and confirmed the module is coherent (not a pile of patches), the
-comments are load-bearing rationale, and the `readFailures` contract is the right shape for Task 7.
-The one real finding was a coverage gap: the two content-read guards in `readFile` (the ones that
-stop an unreadable `.git/index` from shipping an empty-tree commit) were untested because
-`failReadsAt` fails `stat` first. Now pinned by two tests that fail `read`/`readBinary` while `stat`
-succeeds, each verified by mutation. Also dropped the unused `"exists"` from `VaultAdapter` and
-reframed two changelog comments as invariants. 93 tests.
+**Tasks 5–10 are done**, all fully reviewed (spec + code-quality + mutation + real-git probes), plus a
+whole-module (cross-task) review that found and fixed two composition data-loss seams. The entire
+SafeGit read/commit/merge/resolve surface exists in `src/git/safe-git.ts` — the only module allowed to
+import isomorphic-git — with `isRepo`, `hasLocalContent`, `status`, `commitLocal`, `mergeSafe`,
+`resolveConflicts`, `abandonConflict`, `restoreFromHead`, `confirmDeletion`, and module-private
+`isPathAbsent`. Every guard is reproduced against real iso-git 1.41 and mutation-pinned. 166 tests.
 
-**Tasks 5–8 are done**, all fully reviewed. `src/git/safe-git.ts` now exists — the only module
-allowed to import isomorphic-git — with `isRepo`, `hasLocalContent`, `status`, and `commitLocal`.
+Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
 
-Two things the 7+8 round settled that the next session should carry:
+- **`hasLocalContent` throws on a read failure** (not returns false). A transient read over a vault
+  *with* notes must never look "empty" and send `decideConnect` down clone-safe (which would write the
+  remote over real notes). **Task 11's `decideConnect` must let that throw propagate** — do NOT wrap it
+  in a try/catch that treats a failure as "no local content".
+- **`isPathAbsent` — the line that deletes on `absent` — is correct against real git's four error
+  shapes** (missing path → absent; missing/corrupt object → unreadable/refuse). It keys on the *shape*
+  of `data.what`, never on comparing the commit oid.
+- **`commitLocal` refuses an ambiguous interrupted-checkout deletion** (`[head=1, workdir=0, stage=0]`
+  — a remote-added file left un-materialised when an app kill interrupted a fast-forward/merge). This
+  refusal is **resolvable, not terminal**: `restoreFromHead(paths)` re-materialises from HEAD (the
+  "interrupted download" case), `confirmDeletion(paths, message)` commits the deletion after the user
+  confirms it. These are the advanced-op backend for the conflict modal / sync view.
+- **`mergeSafe` clears `pending` on non-conflict exits; `resolveConflicts` refuses a stale `pending`**
+  whose heads no longer match the live refs. Do not cache and replay a conflict resolution across a
+  later fetch/merge.
 
-- **Tasks 7 and 8 were implemented together.** Task 7's test file calls `commitLocal` (a Task 8
-  method) and its `stillOnDisk` referenced an undefined `join`, so Task 7 could not pass alone.
-  They ship as one unit. The plan's Task 7/8 sections have been synced from the real files.
-- **The read-failure guard lives on TWO paths, not one.** `scanWorkingTree` (status/commitLocal)
-  clears and checks `readFailures`. Review found `hasLocalContent` had its own swallowing recursion
-  and ignored the channel — a transient read over a vault *with* notes returned `false`, which would
-  send Task 11's `decideConnect` down the clone-safe path and write the remote over real notes.
-  `hasLocalContent` now refuses on a recorded failure too. **When you write Task 11, rely on that
-  throw propagating** — `decideConnect` must not swallow it.
-
-**Tasks 5–10 are done**, all fully reviewed, plus a whole-module (cross-task) review that found and
-fixed two composition seams. The entire SafeGit read/commit/merge/resolve surface exists and its
-guards are reproduced against real iso-git and mutation-pinned. `isPathAbsent` — the line that
-deletes on `absent` — was verified correct against real git's four error shapes.
-
-Two cross-method seams were found by the holistic review and are now guarded inside SafeGit —
-**Task 12's sync sequence must not undo them:**
-- `commitLocal` refuses a `[head=1, workdir=0, stage=0]` row (an interrupted fast-forward/merge left a
-  remote-added file un-materialised; committing its "deletion" would destroy it on the remote). This
-  refusal is now **resolvable, not terminal**: `restoreFromHead(paths)` re-materialises the file from
-  HEAD (the "interrupted download" case), and `confirmDeletion(paths, message)` commits the deletion
-  once the user confirms it (the "yes I deleted it" case, keeping the read-failure guard). These two
-  are the advanced-operation backend the conflict modal / sync view (Task 15/17) will drive.
-- `mergeSafe` clears `pending` on non-conflict exits and `resolveConflicts` refuses a `pending` whose
-  heads no longer match the live refs. The sync service / conflict modal must not cache and replay a
-  stale conflict resolution.
+**Task 12's sync sequence must not undo those SafeGit guards** — do not force past `commitLocal`'s
+interrupted-checkout refusal (re-run the merge/checkout instead), and re-derive conflicts from a fresh
+`mergeSafe` rather than replaying a stale resolution.
 
 **Advanced/manual mode boundary (user, 2026-08-26; design WITH them at Task 15/17):** the primary path
 is one Sync button; manual Fetch/Merge/Commit/Push buttons should feel like a laptop git CLI (drop
@@ -300,13 +295,12 @@ review) is already written into its plan section: `decideConnect` calls
 throw propagate to the connect UI as refuse-and-explain; do NOT wrap it in a try/catch that treats a
 failure as "no local content", which would reopen the clone-over-your-vault data-loss hole.
 
-**Then Tasks 12 → 19:** the sync service, GitHub API client, and the UI (log modal, conflict modal,
-settings tab, sync panel, plugin entry point, release workflow). Task 18 is the first time
-`src/main.ts` exists and `npm run build` can succeed. Task 19 ends with manual testing on the
-author's iPhone — the final gate; a green suite is not shipping confidence. These are the safety core and the hardest work in the
-plan. Task 7 carries two obligations inherited from Task 5, both already written into its plan
-section: treat a *thrown* `statusMatrix` as a refusal, not only a recorded failure; and confirm every
-claimed deletion against the working tree before staging it.
+**Then Tasks 12 → 19:** the sync service (Task 12 — orchestrates SafeGit's safe exports into the fixed
+sequence; heed the seam warnings above), GitHub API client (13), and the UI (log modal 14, conflict
+modal 15, settings tab 16, sync view 17, plugin entry point 18, release workflow 19). **Task 18 is the
+first time `src/main.ts` exists and `npm run build` can succeed — and the first installable build, so
+it is the minimum phone-testable milestone.** Task 19 ends with manual testing on the author's iPhone
+— the final gate; a green suite is not shipping confidence.
 
 ### Deferred by decision, not oversight
 
