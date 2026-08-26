@@ -32,11 +32,12 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**12 of 19 tasks implemented.** The entire SafeGit safety core is complete — repo state, status,
+**13 of 19 tasks implemented.** The entire SafeGit safety core is complete — repo state, status,
 commit, safe merge, whole-file conflict resolution, and the connect/clone/fetch/push network surface —
 all reviewed, plus a whole-module (cross-task) review that found and fixed two composition data-loss
-seams. The sync service (Task 12) now orchestrates the fixed commit→fetch→merge→push sequence over
-SafeGit, honoring both seams. No GitHub API client and no UI yet.
+seams. The sync service (Task 12) orchestrates the fixed commit→fetch→merge→push sequence over
+SafeGit, honoring both seams, and the GitHub API client (Task 13) answers token/repo questions for the
+connect flow. No UI yet — Tasks 14–18 are the modals, settings, sync view, and plugin entry point.
 
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
@@ -63,7 +64,7 @@ tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 | 10 **SafeGit: conflict resolution** | ✅ implemented + reviewed — `isPathAbsent` reproduced against real git; atomic screening; byte-safe `materialise` |
 | 11 SafeGit: connect/clone/fetch/push | ✅ implemented, both reviews passed — `decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`; `cloneSafe` keeps excluded paths off disk and preserves user edits on re-run (probed against real git); `sameRepo` `.git` normalization mutation-pinned |
 | 12 Sync service | ✅ implemented, both reviews passed — orchestrates commit→fetch→merge→push over injected SafeGit; both cross-method seams honored (thrown-commit STOP, no conflict replay); single-flight lock; seams + lock mutation-pinned |
-| 13 GitHub API client | ⬜ |
+| 13 GitHub API client | ✅ implemented, both reviews passed — `verifyToken`/`inspectRepo` via `requestUrl` (throw:false, res.text+JSON.parse); `size>0` for hasContent is safe (wrong direction caught by non-force push + `hasLocalContent`); PAT only in Authorization header. Task 16 owes a network-error try/catch at the caller |
 | 14 Log modal | ⬜ |
 | 15 Conflict modal | ⬜ plan revised — binary/unreadable rendering |
 | 16 Settings tab | ⬜ plan revised — exclude-everything warning + vault coverage readout |
@@ -79,7 +80,7 @@ next place a mistake could compose the safe primitives unsafely — see the seam
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 183 passed
+npx vitest run       # expect 189 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -260,12 +261,22 @@ the only module allowed to import isomorphic-git — with `isRepo`, `hasLocalCon
 over the injected SafeGit and honors both seams (a thrown `commitLocal` STOPs the sequence rather than
 being forced past; no conflict is cached/replayed — each sync re-derives from a fresh `mergeSafe`). A
 single-flight `running` lock refuses concurrent syncs and releases on every exit (a stuck lock would
-brick sync on iOS). Both seams and the lock are mutation-pinned. 183 tests.
+brick sync on iOS). Both seams and the lock are mutation-pinned.
 
-**Next is Task 13 (GitHub API client)** — `src/github/api.ts`, using Obsidian `requestUrl` (never
-`fetch`), `throw:false`, always `await`-then-read (see §4). Then the UI: Tasks 14–18. **Task 15 (the
-conflict modal) still carries a seam:** it must NOT cache a conflict and replay it — re-derive from a
-fresh `mergeSafe` after any later fetch/merge (see the seam note below and the Task 12/15 plan headers).
+**Task 13 (GitHub API client) is done too** — `src/github/api.ts` (`verifyToken`, `inspectRepo`) over
+`requestUrl` with `throw:false` and `res.text`+`JSON.parse`. `hasContent` via `size>0` is safe even
+under GitHub's async `size` lag: the only wrong direction (repo has commits but reads `size:0` →
+`init-push`) is caught by `initAndPush`'s non-force push (the server rejects a non-fast-forward loudly)
+plus `decideConnect`'s independent `hasLocalContent()` check. 189 tests.
+
+**Next is Task 14 (the log modal)** — `src/ui/log-modal.ts`, the first UI task. Mobile has no dev
+console, so this modal is the only way to see what a sync did; the plan has the full code. UI tasks 14
+and 15 are `tsc`-only (no test suite) per the plan; 16–17 follow, then 18 (`src/main.ts` — the first
+installable build). **Task 15 (the conflict modal) carries the no-replay seam:** it must NOT cache a
+conflict and replay it — re-derive from a fresh `mergeSafe` after any later fetch/merge. **Task 16
+(settings tab) owes a network-error try/catch** around `verifyToken`/`inspectRepo` in its connect
+action (the client is deliberately thin and lets a network throw propagate; catch it at the caller and
+show a Notice). Both are recorded in the Task 15/16 plan headers.
 
 Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
 
@@ -296,25 +307,29 @@ data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *ti
 data can be lost silently*. Plan notes are on Task 15 and Task 17.
 
 **Minimum phone-testable version: after Task 18** (creates `src/main.ts`, the first build that
-installs). Tasks 13→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
+installs). Tasks 14→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
 against a throwaway vault + a private test repo before the real vault.
 
 **All subagents run on Opus** (user, 2026-08-26) — implementers included, superseding §3's "implementers
 on Sonnet" line below.
 
-**Tasks 11 and 12 are done.** Task 11 (`decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`): its
-carried obligation held — `decideConnect` lets `hasLocalContent()`'s read-failure throw propagate (a
-live probe confirmed it refuses rather than falling to clone-safe), and `cloneSafe` keeps excluded
-paths off disk with `force:false`, preserving user edits even when re-run after an interrupted checkout
-(both probed against real git). Task 12 (`SyncService`): orchestrates commit→fetch→merge→push over the
-injected SafeGit, honoring both seams; single-flight lock releases on every exit.
+**Tasks 11, 12, and 13 are done.** Task 11 (`decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`):
+`decideConnect` lets `hasLocalContent()`'s read-failure throw propagate (probed), and `cloneSafe` keeps
+excluded paths off disk with `force:false`, preserving user edits even when re-run after an interrupted
+checkout. Task 12 (`SyncService`): orchestrates commit→fetch→merge→push, honoring both seams;
+single-flight lock releases on every exit. Task 13 (`GitHubApi`): `verifyToken`/`inspectRepo` over
+`requestUrl`; `size>0` for hasContent is safe (wrong direction caught by non-force push + local-content
+check); PAT only in the Authorization header.
 
-**Start with Task 13, the GitHub API client** (`src/github/api.ts`). It talks to GitHub's REST API to
-answer "does this repo exist / does it have content" for the connect flow. The plan section has the
-full code and tests. Load-bearing rules from §4: use Obsidian's `requestUrl`, **never** `fetch`;
-always `await` the call then read properties (the awaitable-property form is not modelled by the test
-stub); always pass `throw:false` and inspect the status yourself, never key on `err.status`. The test
-stub is `setRequestUrlHandler` in `tests/mocks/obsidian.ts`.
+**Start with Task 14, the log modal** (`src/ui/log-modal.ts`) — the first UI task and the only way to
+see what a sync did on a phone (no dev console). The plan has the full code; it renders a `SyncReport`
+into a copyable `<pre>`. Per the plan, Tasks 14 and 15 are verified by `npx tsc --noEmit` only (no test
+suite for the DOM modals — the Obsidian `Modal`/DOM surface is stubbed just enough to typecheck). Two
+UI-task obligations are recorded in their plan headers: **Task 15** (conflict modal) must NOT cache and
+replay a conflict — re-derive from a fresh `mergeSafe`; **Task 16** (settings tab) must wrap
+`verifyToken`/`inspectRepo` in try/catch so an offline connect shows a Notice, not an unhandled
+rejection (the client is deliberately thin). §4's `noImplicitOverride` rule applies to the modal
+lifecycle methods (`onOpen`/`onClose` need `override`).
 
 **Then Tasks 13 → 19:** the GitHub API client (13), and the UI (log modal 14, conflict
 modal 15, settings tab 16, sync view 17, plugin entry point 18, release workflow 19). **Task 18 is the

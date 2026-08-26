@@ -4623,6 +4623,15 @@ git commit -m "feat: whole-file conflict resolution modal"
 **Files:**
 - Create: `src/ui/settings-tab.ts`
 
+> **Carried from the Task 13 code-quality review (2026-08-26):** `GitHubApi` is deliberately thin —
+> `verifyToken()` and `inspectRepo()` mirror `requestUrl`'s contract, so a real network failure (no
+> connectivity) makes `requestUrl` *reject*, and that throw propagates raw out of both methods (they
+> have no try/catch, by design). The connect flow that calls them (this tab's `connect()` action)
+> MUST wrap the `verifyToken`/`inspectRepo` calls in try/catch and surface an offline failure as a
+> friendly `Notice`, not an unhandled rejection. This is a UX gap, not a data-loss one, but it must be
+> handled here rather than fattening the client. (Reviewer's recommendation, agreed: keep the client
+> thin, catch at the caller.)
+
 - [ ] **Step 1: Create `src/ui/settings-tab.ts`**
 
 Note the explicit token-leak warning when un-excluding `.obsidian/` — the token lives in
