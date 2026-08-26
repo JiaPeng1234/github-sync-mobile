@@ -4775,18 +4775,26 @@ export class SettingsTab extends PluginSettingTab {
           new Notice("Fill in token, owner, and repository first");
           return;
         }
-        const api = new GitHubApi(s.token);
-        const who = await api.verifyToken();
-        if (!who.ok) {
-          new Notice(`Token rejected: ${who.error}`);
-          return;
+        // verifyToken/inspectRepo are thin and let a network failure (requestUrl reject)
+        // propagate. On a phone that would be a silent unhandled rejection, so catch it
+        // here and tell the user, rather than fattening the client. (Task 13 review.)
+        try {
+          const api = new GitHubApi(s.token);
+          const who = await api.verifyToken();
+          if (!who.ok) {
+            new Notice(`Token rejected: ${who.error}`);
+            return;
+          }
+          const info = await api.inspectRepo(s.owner, s.repo);
+          new Notice(
+            info.exists
+              ? `OK as ${who.login} — repo found${info.hasContent ? " with content" : " (empty)"}`
+              : `Signed in as ${who.login}, but ${s.owner}/${s.repo} was not found`,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          new Notice(`Could not reach GitHub — check your connection. (${msg})`);
         }
-        const info = await api.inspectRepo(s.owner, s.repo);
-        new Notice(
-          info.exists
-            ? `OK as ${who.login} — repo found${info.hasContent ? " with content" : " (empty)"}`
-            : `Signed in as ${who.login}, but ${s.owner}/${s.repo} was not found`,
-        );
       }),
     );
 
@@ -4926,7 +4934,11 @@ export class SettingsTab extends PluginSettingTab {
 - [ ] **Step 2: Typecheck**
 
 Run: `npx tsc --noEmit`
-Expected: errors only about the not-yet-created `../main` import. Proceed; Task 18 resolves it.
+Expected: errors ONLY about the not-yet-created `../main` import — the `TS2307` on the import line,
+plus three downstream `TS7006` "implicitly any" errors on the `excludePatterns` callbacks (because
+`this.plugin` collapses to the unresolved `../main` type, `settings.excludePatterns` becomes `any`).
+All four vanish once `src/main.ts` exists. Proceed; Task 18 resolves it. (Verified in the Task 16
+round with a throwaway `main.ts` stub — no other typing error hides in the file.)
 
 - [ ] **Step 3: Commit**
 
