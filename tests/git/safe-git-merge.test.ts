@@ -462,6 +462,73 @@ describe("SafeGit idempotency", () => {
   });
 
   /**
+   * The clean-MERGE twin of the interrupted fast-forward test above.
+   *
+   * A killed checkout leaves the identical `[head=1, workdir=0, stage=0]` state whether the
+   * producer was a fast-forward or a clean merge: `mergeSafe`'s `merged` path runs
+   * `git.merge({dryRun:false})` (which advances the branch ref) and THEN `checkoutTracked`,
+   * and the crash window is that same post-ref checkout. The consumer-side guard in
+   * commitLocal covers both producers, but only the fast-forward path was pinned; a refactor
+   * moving the guard could regress the clean-merge path undetected. This pins it.
+   *
+   * Setup is a genuine DIVERGENCE that takes mergeSafe's `merged` branch (not fast-forward,
+   * not conflict): local commits a change to notes/a.md, remote adds a DIFFERENT new file
+   * notes/c.md. Different files on both sides, both text, so the engine merges cleanly. The
+   * app is killed while checkoutTracked materialises the remote-added notes/c.md.
+   */
+  it("refuses to commit a deletion for a remote-added file left unmaterialised by an interrupted CLEAN MERGE", async () => {
+    const h = await makeHarness();
+    const first = await initRepo(h);
+
+    // Local diverges: commit a change to a file only local touches.
+    await h.write("notes/a.md", "local edit\n");
+    await h.commit(["notes/a.md"], "local edits a");
+
+    // Remote diverges on a DIFFERENT file, so mergeSafe takes the clean `merged` path.
+    const remoteOid = await divergeRemote(h, first, { "notes/c.md": "remote c\n" }, "remote adds c");
+
+    // divergeRemote force-checks-out between lineages; make sure the remote-only file is
+    // not left on disk from setup, so the assertions below genuinely reflect mergeSafe.
+    if (h.adapter.paths().includes("notes/c.md")) await h.adapter.remove("notes/c.md");
+
+    // Simulate the iOS kill: the merge commits and advances the ref, then the post-merge
+    // checkoutTracked fails while writing the incoming file.
+    const realWrite = h.adapter.write.bind(h.adapter);
+    const realWriteBinary = h.adapter.writeBinary.bind(h.adapter);
+    h.adapter.write = async (p, ...rest) => {
+      if (p.endsWith("c.md")) throw new Error("SIMULATED app kill mid-checkout");
+      return realWrite(p, ...(rest as [string]));
+    };
+    h.adapter.writeBinary = async (p, ...rest) => {
+      if (p.endsWith("c.md")) throw new Error("SIMULATED app kill mid-checkout");
+      return realWriteBinary(p, ...(rest as [ArrayBuffer]));
+    };
+    await expect(h.safeGit.mergeSafe()).rejects.toBeTruthy();
+    h.adapter.write = realWrite;
+    h.adapter.writeBinary = realWriteBinary;
+
+    // The interrupted state: the merge commit's tree tracks notes/c.md, but it never
+    // reached disk. HEAD is a real merge commit, not the pre-merge local head or remote.
+    const head = await git.resolveRef({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(head).not.toBe(remoteOid);
+    const tracked = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(tracked).toContain("notes/c.md");
+    expect(h.adapter.paths()).not.toContain("notes/c.md");
+
+    // The resync commit must REFUSE rather than delete the still-tracked file.
+    await expect(h.safeGit.commitLocal("sync")).rejects.toThrow(/ambiguous, resolvable/i);
+
+    // notes/c.md is still tracked in HEAD — its deletion was not committed.
+    const after = await git.listFiles({ fs: h.fs, dir: h.dir, ref: "HEAD" });
+    expect(after).toContain("notes/c.md");
+
+    // And the escape hatch recovers it, mirroring the fast-forward companion.
+    await h.safeGit.restoreFromHead(["notes/c.md"]);
+    expect(await h.adapter.read("notes/c.md")).toBe("remote c\n");
+    expect(await h.safeGit.commitLocal("sync")).toBeNull();
+  });
+
+  /**
    * The critical regression test: the user is NOT permanently stranded on a genuine
    * interrupted OUTGOING deletion.
    *
