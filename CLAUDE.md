@@ -28,15 +28,16 @@ When choosing between convenient and cannot-lose-data, choose the latter.
 
 ## Status
 
-11 of 19 tasks implemented. The entire SafeGit safety core is complete (`src/git/safe-git.ts` — repo
-state, status, commit, safe merge, whole-file conflict resolution, and connect/clone/fetch/push), all
-reviewed. No sync service, GitHub API client, or UI yet. Next is Task 12 (sync service). See
+12 of 19 tasks implemented. The SafeGit safety core is complete (`src/git/safe-git.ts` — repo state,
+status, commit, safe merge, whole-file conflict resolution, connect/clone/fetch/push), and the sync
+service (`src/sync/sync-service.ts`) orchestrates the commit→fetch→merge→push sequence over it — all
+reviewed. No GitHub API client or UI yet. Next is Task 13 (GitHub API client). See
 [docs/HANDOVER.md](docs/HANDOVER.md) §6 for exact next steps and the guards a new session must carry.
 
 ```bash
 npm ci
 npx tsc --noEmit   # expect exit 0
-npx vitest run     # expect 173 passed (run a single file: npx vitest run tests/git/safe-git-merge.test.ts)
+npx vitest run     # expect 183 passed (run a single file: npx vitest run tests/git/safe-git-merge.test.ts)
 ```
 
 `npm run build` fails until `src/main.ts` exists (Task 18) — that is expected, not a break. Task 18 is

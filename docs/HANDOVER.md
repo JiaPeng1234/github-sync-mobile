@@ -32,10 +32,11 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**11 of 19 tasks implemented.** The entire SafeGit safety core is now complete — repo state, status,
+**12 of 19 tasks implemented.** The entire SafeGit safety core is complete — repo state, status,
 commit, safe merge, whole-file conflict resolution, and the connect/clone/fetch/push network surface —
 all reviewed, plus a whole-module (cross-task) review that found and fixed two composition data-loss
-seams. No sync service, no GitHub API client, no UI yet.
+seams. The sync service (Task 12) now orchestrates the fixed commit→fetch→merge→push sequence over
+SafeGit, honoring both seams. No GitHub API client and no UI yet.
 
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
@@ -61,7 +62,7 @@ tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 | 9 **SafeGit: safe merge** | ✅ implemented + reviewed — binary pre-screen reproduced against real git; `type-change` unmergeable added |
 | 10 **SafeGit: conflict resolution** | ✅ implemented + reviewed — `isPathAbsent` reproduced against real git; atomic screening; byte-safe `materialise` |
 | 11 SafeGit: connect/clone/fetch/push | ✅ implemented, both reviews passed — `decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`; `cloneSafe` keeps excluded paths off disk and preserves user edits on re-run (probed against real git); `sameRepo` `.git` normalization mutation-pinned |
-| 12 Sync service | ⬜ plan revised — `unmergeable` handling |
+| 12 Sync service | ✅ implemented, both reviews passed — orchestrates commit→fetch→merge→push over injected SafeGit; both cross-method seams honored (thrown-commit STOP, no conflict replay); single-flight lock; seams + lock mutation-pinned |
 | 13 GitHub API client | ⬜ |
 | 14 Log modal | ⬜ |
 | 15 Conflict modal | ⬜ plan revised — binary/unreadable rendering |
@@ -78,7 +79,7 @@ next place a mistake could compose the safe primitives unsafely — see the seam
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 173 passed
+npx vitest run       # expect 183 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -254,10 +255,17 @@ the only module allowed to import isomorphic-git — with `isRepo`, `hasLocalCon
 `commitLocal`, `mergeSafe`, `resolveConflicts`, `abandonConflict`, `restoreFromHead`,
 `confirmDeletion`, `decideConnect`, `cloneSafe`, `initAndPush`, `fetch`, `push`, and module-private
 `isPathAbsent`/`sameRepo`. Every guard is reproduced against real iso-git 1.41 and mutation-pinned.
-173 tests.
 
-**Next is Task 12 (sync service)** — the first place a mistake could compose the safe primitives
-unsafely. Its plan is already revised; heed the seam warnings below and in the Task 12 plan header.
+**Task 12 (sync service) is done too** — `src/sync/sync-service.ts` orchestrates commit→fetch→merge→push
+over the injected SafeGit and honors both seams (a thrown `commitLocal` STOPs the sequence rather than
+being forced past; no conflict is cached/replayed — each sync re-derives from a fresh `mergeSafe`). A
+single-flight `running` lock refuses concurrent syncs and releases on every exit (a stuck lock would
+brick sync on iOS). Both seams and the lock are mutation-pinned. 183 tests.
+
+**Next is Task 13 (GitHub API client)** — `src/github/api.ts`, using Obsidian `requestUrl` (never
+`fetch`), `throw:false`, always `await`-then-read (see §4). Then the UI: Tasks 14–18. **Task 15 (the
+conflict modal) still carries a seam:** it must NOT cache a conflict and replay it — re-derive from a
+fresh `mergeSafe` after any later fetch/merge (see the seam note below and the Task 12/15 plan headers).
 
 Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
 
@@ -288,25 +296,25 @@ data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *ti
 data can be lost silently*. Plan notes are on Task 15 and Task 17.
 
 **Minimum phone-testable version: after Task 18** (creates `src/main.ts`, the first build that
-installs). Tasks 12→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
+installs). Tasks 13→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
 against a throwaway vault + a private test repo before the real vault.
 
 **All subagents run on Opus** (user, 2026-08-26) — implementers included, superseding §3's "implementers
 on Sonnet" line below.
 
-**Task 11 is done** — `decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push` shipped and reviewed.
-Its carried obligation held: `decideConnect` lets `hasLocalContent()`'s read-failure throw propagate
-(a live read-failure probe confirmed it refuses rather than falling to clone-safe), and `cloneSafe`
-keeps excluded paths off disk with `force:false`, preserving user edits even when re-run after an
-interrupted checkout (both probed against real git).
+**Tasks 11 and 12 are done.** Task 11 (`decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`): its
+carried obligation held — `decideConnect` lets `hasLocalContent()`'s read-failure throw propagate (a
+live probe confirmed it refuses rather than falling to clone-safe), and `cloneSafe` keeps excluded
+paths off disk with `force:false`, preserving user edits even when re-run after an interrupted checkout
+(both probed against real git). Task 12 (`SyncService`): orchestrates commit→fetch→merge→push over the
+injected SafeGit, honoring both seams; single-flight lock releases on every exit.
 
-**Start with Task 12, the sync service** (`src/sync/sync-service.ts`). It orchestrates SafeGit's safe
-exports into the fixed sequence — commit → fetch → merge → push — and knows the ORDER; SafeGit knows
-the safety. The plan section has the full code and 8 tests; the service is pure orchestration over an
-injected `SafeGit`, so its tests use a **fake** git (unlike the SafeGit suites, which run real git).
-Heed the two seam warnings (in the Task 12 plan header and below): do not force past `commitLocal`'s
-interrupted-checkout refusal (re-run the merge/checkout instead), and do not cache and replay a
-conflict across a later fetch/merge — re-derive it from a fresh `mergeSafe`.
+**Start with Task 13, the GitHub API client** (`src/github/api.ts`). It talks to GitHub's REST API to
+answer "does this repo exist / does it have content" for the connect flow. The plan section has the
+full code and tests. Load-bearing rules from §4: use Obsidian's `requestUrl`, **never** `fetch`;
+always `await` the call then read properties (the awaitable-property form is not modelled by the test
+stub); always pass `throw:false` and inspect the status yourself, never key on `err.status`. The test
+stub is `setRequestUrlHandler` in `tests/mocks/obsidian.ts`.
 
 **Then Tasks 13 → 19:** the GitHub API client (13), and the UI (log modal 14, conflict
 modal 15, settings tab 16, sync view 17, plugin entry point 18, release workflow 19). **Task 18 is the
