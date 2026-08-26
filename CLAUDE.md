@@ -28,19 +28,33 @@ When choosing between convenient and cannot-lose-data, choose the latter.
 
 ## Status
 
-5 of 19 tasks implemented: build toolchain, test harness, shared types. No sync code or UI yet.
+10 of 19 tasks implemented. The entire SafeGit safety core exists (`src/git/safe-git.ts` — repo
+state, status, commit, safe merge, whole-file conflict resolution), all reviewed. No sync service,
+GitHub API client, or UI yet. Next is Task 11 (connect/clone/fetch/push). See
+[docs/HANDOVER.md](docs/HANDOVER.md) §6 for exact next steps and the guards a new session must carry.
 
 ```bash
+npm ci
 npx tsc --noEmit   # expect exit 0
-npx vitest run     # expect 90 passed
+npx vitest run     # expect 166 passed (run a single file: npx vitest run tests/git/safe-git-merge.test.ts)
 ```
 
-`npm run build` fails until `src/main.ts` exists (Task 18). That is expected.
+`npm run build` fails until `src/main.ts` exists (Task 18) — that is expected, not a break. Task 18 is
+also the first installable build (the minimum phone-testable milestone).
 
 ## Conventions
 
 - Tests run **real isomorphic-git** against an in-memory filesystem; only the network is mocked.
   Do not mock git — that would mock away the thing being proven.
 - `src/git/safe-git.ts` is the only module permitted to import `isomorphic-git`.
-- Reviewers verify by **running** things, not by reading. See the workflow in the handover.
+- **Work runs through subagents on a fixed per-task loop** (implement → spec review → code-quality
+  review → commit), and **every subagent runs on Opus** (implementers included). The judgment lives
+  in the reviews.
+- **Reviewers verify by running, not reading** — build a probe outside the repo, execute real git,
+  and mutation-test every safety guard (break the guard, confirm a test dies). Every serious defect
+  found here — including silent binary corruption and two cross-method data-loss seams — was caught
+  that way, not by inspection. Weigh findings by whether data could actually be lost.
+- **Fix the plan, not just the code**, and sync plan code blocks from the real files (hand
+  re-transcription once reintroduced a NUL byte). Never produce a native Node `Buffer` — stay on
+  `Uint8Array`/`ArrayBuffer` (see HANDOVER §4).
 - Committing directly to `main` and pushing is authorised.
