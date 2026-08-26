@@ -32,9 +32,10 @@ Mobile is the **target**. Desktop is a development convenience only.
 
 ## 2. Current state
 
-**10 of 19 tasks implemented.** The entire SafeGit safety core exists — repo state, status, commit,
-safe merge, and whole-file conflict resolution — all reviewed, plus a whole-module (cross-task) review
-that found and fixed two composition data-loss seams. No sync service, no GitHub API client, no UI yet.
+**11 of 19 tasks implemented.** The entire SafeGit safety core is now complete — repo state, status,
+commit, safe merge, whole-file conflict resolution, and the connect/clone/fetch/push network surface —
+all reviewed, plus a whole-module (cross-task) review that found and fixed two composition data-loss
+seams. No sync service, no GitHub API client, no UI yet.
 
 ```
 src/types.ts        Task 3 — PluginSettings, ConflictSide, ConflictFile, MergeOutcome, SyncReport…
@@ -59,7 +60,7 @@ tests/git/, tests/helpers/  the SafeGit test suites + shared harness (repo.ts)
 | 8 SafeGit: commit | ✅ implemented + reviewed **with Task 7** — Task 7's tests call `commitLocal`, so they ship together |
 | 9 **SafeGit: safe merge** | ✅ implemented + reviewed — binary pre-screen reproduced against real git; `type-change` unmergeable added |
 | 10 **SafeGit: conflict resolution** | ✅ implemented + reviewed — `isPathAbsent` reproduced against real git; atomic screening; byte-safe `materialise` |
-| 11 SafeGit: connect/clone/fetch/push | ⬜ |
+| 11 SafeGit: connect/clone/fetch/push | ✅ implemented, both reviews passed — `decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push`; `cloneSafe` keeps excluded paths off disk and preserves user edits on re-run (probed against real git); `sameRepo` `.git` normalization mutation-pinned |
 | 12 Sync service | ⬜ plan revised — `unmergeable` handling |
 | 13 GitHub API client | ⬜ |
 | 14 Log modal | ⬜ |
@@ -77,7 +78,7 @@ next place a mistake could compose the safe primitives unsafely — see the seam
 ```bash
 npm ci
 npx tsc --noEmit     # expect exit 0
-npx vitest run       # expect 166 passed
+npx vitest run       # expect 173 passed
 ```
 
 `npm run build` will fail until `src/main.ts` exists (Task 18) — that is expected, not a break.
@@ -246,12 +247,17 @@ Plus two learned the hard way, both in [decisions-and-learnings.md](decisions-an
 
 ## 6. What to do next
 
-**Tasks 5–10 are done**, all fully reviewed (spec + code-quality + mutation + real-git probes), plus a
-whole-module (cross-task) review that found and fixed two composition data-loss seams. The entire
-SafeGit read/commit/merge/resolve surface exists in `src/git/safe-git.ts` — the only module allowed to
-import isomorphic-git — with `isRepo`, `hasLocalContent`, `status`, `commitLocal`, `mergeSafe`,
-`resolveConflicts`, `abandonConflict`, `restoreFromHead`, `confirmDeletion`, and module-private
-`isPathAbsent`. Every guard is reproduced against real iso-git 1.41 and mutation-pinned. 166 tests.
+**Tasks 5–11 are done** — the SafeGit safety core is COMPLETE — all fully reviewed (spec +
+code-quality + mutation + real-git probes), plus a whole-module (cross-task) review that found and
+fixed two composition data-loss seams. The entire SafeGit surface exists in `src/git/safe-git.ts` —
+the only module allowed to import isomorphic-git — with `isRepo`, `hasLocalContent`, `status`,
+`commitLocal`, `mergeSafe`, `resolveConflicts`, `abandonConflict`, `restoreFromHead`,
+`confirmDeletion`, `decideConnect`, `cloneSafe`, `initAndPush`, `fetch`, `push`, and module-private
+`isPathAbsent`/`sameRepo`. Every guard is reproduced against real iso-git 1.41 and mutation-pinned.
+173 tests.
+
+**Next is Task 12 (sync service)** — the first place a mistake could compose the safe primitives
+unsafely. Its plan is already revised; heed the seam warnings below and in the Task 12 plan header.
 
 Load-bearing facts from the SafeGit rounds that a Task 11+ session must carry:
 
@@ -282,21 +288,27 @@ data-loss decision and iOS has no CLI to undo a wrong guess. Manual controls *ti
 data can be lost silently*. Plan notes are on Task 15 and Task 17.
 
 **Minimum phone-testable version: after Task 18** (creates `src/main.ts`, the first build that
-installs). Tasks 11→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
+installs). Tasks 12→18 remain; Task 19 (release/docs) is not needed to sideload a dev build. Test
 against a throwaway vault + a private test repo before the real vault.
 
 **All subagents run on Opus** (user, 2026-08-26) — implementers included, superseding §3's "implementers
 on Sonnet" line below.
 
-**Start with Task 11, SafeGit: connect decision, clone-safe, fetch, push** — the LAST SafeGit task.
-It adds `decideConnect`, `cloneSafe`, `fetch`, `push`. Its carried obligation (from the Task 7
-review) is already written into its plan section: `decideConnect` calls
-`if (await this.hasLocalContent())`, and `hasLocalContent` now THROWS on a read failure — let that
-throw propagate to the connect UI as refuse-and-explain; do NOT wrap it in a try/catch that treats a
-failure as "no local content", which would reopen the clone-over-your-vault data-loss hole.
+**Task 11 is done** — `decideConnect`/`cloneSafe`/`initAndPush`/`fetch`/`push` shipped and reviewed.
+Its carried obligation held: `decideConnect` lets `hasLocalContent()`'s read-failure throw propagate
+(a live read-failure probe confirmed it refuses rather than falling to clone-safe), and `cloneSafe`
+keeps excluded paths off disk with `force:false`, preserving user edits even when re-run after an
+interrupted checkout (both probed against real git).
 
-**Then Tasks 12 → 19:** the sync service (Task 12 — orchestrates SafeGit's safe exports into the fixed
-sequence; heed the seam warnings above), GitHub API client (13), and the UI (log modal 14, conflict
+**Start with Task 12, the sync service** (`src/sync/sync-service.ts`). It orchestrates SafeGit's safe
+exports into the fixed sequence — commit → fetch → merge → push — and knows the ORDER; SafeGit knows
+the safety. The plan section has the full code and 8 tests; the service is pure orchestration over an
+injected `SafeGit`, so its tests use a **fake** git (unlike the SafeGit suites, which run real git).
+Heed the two seam warnings (in the Task 12 plan header and below): do not force past `commitLocal`'s
+interrupted-checkout refusal (re-run the merge/checkout instead), and do not cache and replay a
+conflict across a later fetch/merge — re-derive it from a fresh `mergeSafe`.
+
+**Then Tasks 13 → 19:** the GitHub API client (13), and the UI (log modal 14, conflict
 modal 15, settings tab 16, sync view 17, plugin entry point 18, release workflow 19). **Task 18 is the
 first time `src/main.ts` exists and `npm run build` can succeed — and the first installable build, so
 it is the minimum phone-testable milestone.** Task 19 ends with manual testing on the author's iPhone
