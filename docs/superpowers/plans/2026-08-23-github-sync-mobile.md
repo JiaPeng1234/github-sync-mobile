@@ -575,10 +575,14 @@ export type MergeOutcome =
 
 /**
  * Histories isomorphic-git cannot merge: no recursive merge strategy, so it throws
- * when several merge bases exist (two devices diverging), and it cannot join two
- * unrelated roots.
+ * when several merge bases exist (two devices diverging), it cannot join two
+ * unrelated roots, and it cannot reconcile a file-vs-directory type change.
+ * (`type-change` was added during Task 9; kept here in sync with src/types.ts.)
  */
-export type UnmergeableReason = "unrelated-histories" | "multiple-merge-bases";
+export type UnmergeableReason =
+  | "unrelated-histories"
+  | "multiple-merge-bases"
+  | "type-change";
 
 export interface RepoStatus {
   /** Non-excluded files differing from HEAD. */
@@ -3973,6 +3977,25 @@ describe("SyncService.sync", () => {
     expect(report.success).toBe(false);
   });
 
+  it("stops after a thrown commit without fetching, merging, or pushing", async () => {
+    // A thrown commitLocal is the interrupted-checkout refusal: an earlier merge left a
+    // remote-tracked file un-materialised, so committing now would record a false deletion.
+    // The service must surface it as a failed commit and STOP — never force past it.
+    const g = fakeGit({
+      commitLocal: vi.fn(async () => {
+        throw new Error("a file was never written to this device — re-run sync");
+      }),
+    });
+    const report = await new SyncService(g as never, () => "msg").sync();
+
+    expect(report.steps.find((s) => s.name === "commit")?.result).toBe("failed");
+    expect(report.steps.find((s) => s.name === "commit")?.detail).toMatch(/re-run sync/i);
+    expect(g.fetch).not.toHaveBeenCalled();
+    expect(g.mergeSafe).not.toHaveBeenCalled();
+    expect(g.push).not.toHaveBeenCalled();
+    expect(report.success).toBe(false);
+  });
+
   it("marks commit as skipped when there was nothing to commit", async () => {
     const g = fakeGit({ commitLocal: vi.fn(async () => null) });
     const report = await new SyncService(g as never, () => "msg").sync();
@@ -3997,6 +4020,19 @@ describe("SyncService.sync", () => {
     await expect(svc.sync()).rejects.toThrow(/already in progress/i);
     release();
     await first;
+  });
+
+  it("releases the lock after a sync so the next one can run", async () => {
+    // On iOS there is no way to reset a wedged plugin, so a stuck `running` flag would
+    // brick sync forever. The lock must release on every exit — including a thrown step.
+    const svc = new SyncService(
+      fakeGit({ commitLocal: vi.fn(async () => { throw new Error("boom"); }) }) as never,
+      () => "msg",
+    );
+    await svc.sync();
+    expect(svc.isRunning()).toBe(false);
+    await expect(svc.sync()).resolves.toBeDefined();
+    expect(svc.isRunning()).toBe(false);
   });
 });
 ```
@@ -4154,16 +4190,27 @@ function message(err: unknown): string {
 }
 
 function describeUnmergeable(reason: UnmergeableReason): string {
-  return reason === "unrelated-histories"
-    ? "local and remote share no history — stopped without changing anything"
-    : "history diverged in a way the git engine cannot merge — stopped safely";
+  switch (reason) {
+    case "unrelated-histories":
+      return "local and remote share no history — stopped without changing anything";
+    case "type-change":
+      return "a path is a file on one side and a folder on the other — the git engine cannot merge that; reconcile it on a desktop, then sync again";
+    default:
+      return "history diverged in a way the git engine cannot merge — stopped safely";
+  }
 }
 ```
+
+> **Code-quality review (2026-08-26):** `type-change` gets its own branch rather than falling to
+> the generic "history diverged" string — a `type-change` is a file-vs-folder collision, not a
+> diverged history, and it is actionable, so the phone-facing message must say so.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/sync/sync-service.test.ts`
-Expected: PASS, 8 tests.
+Expected: PASS, 10 tests. (Two tests added in review pin the previously-decorative seams: a thrown
+`commitLocal` must STOP the sequence, and the `running` lock must release on every exit — a stuck
+lock would brick sync on iOS. Both were mutation-verified to kill their guard.)
 
 - [ ] **Step 5: Commit**
 
