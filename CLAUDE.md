@@ -15,6 +15,7 @@ It is the entry point. Everything else hangs off it:
 | [docs/superpowers/specs/2026-08-23-github-sync-mobile-design.md](docs/superpowers/specs/2026-08-23-github-sync-mobile-design.md) | Design and the safety invariants |
 | [docs/superpowers/plans/2026-08-23-github-sync-mobile.md](docs/superpowers/plans/2026-08-23-github-sync-mobile.md) | 19 tasks, with exact code and tests |
 | [docs/decisions-and-learnings.md](docs/decisions-and-learnings.md) | Why decisions were made; what review caught |
+| [docs/INSTALL-AND-TEST.md](docs/INSTALL-AND-TEST.md) | Build `main.js`, sideload/BRAT onto a phone, what to test |
 
 ## The one thing to know
 

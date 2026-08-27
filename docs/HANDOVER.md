@@ -9,6 +9,7 @@ it points at.
 | [Design spec](superpowers/specs/2026-08-23-github-sync-mobile-design.md) | What is being built and why; the safety invariants | Before touching `src/git/` |
 | [Implementation plan](superpowers/plans/2026-08-23-github-sync-mobile.md) | 19 tasks with exact code and tests | Before implementing any task |
 | [Decisions and learnings](decisions-and-learnings.md) | Why choices were made; what review caught | Before changing a design decision |
+| [Install and test](INSTALL-AND-TEST.md) | Build `main.js`, sideload/BRAT onto a phone, what to test | Before a phone test |
 
 ---
 
